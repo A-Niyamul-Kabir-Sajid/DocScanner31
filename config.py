@@ -52,12 +52,33 @@ DEFAULT_WEB_HOST: str = "0.0.0.0"
 DEFAULT_WEB_PORT: int = 5000
 
 # --------------------------------------------------------------------------- #
-# Document detection (YOLOv8n + OpenCV contour fallback)
+# Document detection (pure OpenCV, no YOLO)
 # --------------------------------------------------------------------------- #
-ENABLE_YOLO: bool = True
+ENABLE_YOLO: bool = False                 # legacy flag - kept for back-compat
 YOLO_MODEL_PATH: Path = PROJECT_ROOT / "yolov8n.pt"
 YOLO_CONFIDENCE: float = 0.35
 DOC_MIN_AREA_RATIO: float = 0.08          # doc must cover >= 8% of frame
+
+# Contour scoring weights (sum = 1.0).  Tuned for typical desk-mounted webcams.
+SCORE_W_AREA: float = 0.40
+SCORE_W_RECTANGULARITY: float = 0.30
+SCORE_W_CONVEXITY: float = 0.15
+SCORE_W_ASPECT: float = 0.10
+SCORE_W_CENTER: float = 0.05
+# Acceptable aspect ratio range (w/h).  Receipts ~0.5, A4 ~0.71, books ~0.8.
+ASPECT_MIN: float = 0.45
+ASPECT_MAX: float = 1.55
+# Canny / morphology tuning.
+CANNY_KERNEL: int = 5                     # 5x5 Gaussian + closing kernel
+HOUGH_THRESHOLD: int = 80                 # accumulator threshold for HoughLinesP
+HOUGH_MIN_LINE: int = 60                  # min line length (px)
+HOUGH_MAX_GAP: int = 10                   # max gap between line segments
+MIN_QUAD_CONFIDENCE: float = 0.4          # reject detections below this
+# Corner sub-pixel search window.
+CORNERSUBPIX_WIN: int = 7
+CORNERSUBPIX_ZEROZONE: int = -1
+CORNERSUBPIX_CRITERIA_EPS: float = 0.01
+CORNERSUBPIX_MAX_ITER: int = 40
 
 # --------------------------------------------------------------------------- #
 # Quality gate (per-capture)

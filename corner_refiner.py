@@ -62,6 +62,123 @@ class CornerRefiner:
         """Same as :meth:`refine` but the caller already computed the edges."""
         return self._approx_quad(edges, width, height)
 
+    def refine_inner_page(
+        self,
+        frame_bgr: np.ndarray,
+        outer_corners: np.ndarray,
+    ) -> Tuple[Optional[np.ndarray], float]:
+        """Given the *outer* corners of a book/cover, find the inner page
+        rectangle (the white area inside a dark cover/border).
+
+        ``outer_corners`` must be 4 points in (TL, TR, BR, BL) order.
+        Returns the inner 4 corners in the same order, plus a confidence.
+
+        Algorithm:
+            1. Warp the frame using outer_corners into a flat rectangle.
+            2. Build a binary mask of bright pixels (>=BRIGHT_THRESHOLD).
+            3. Find the largest bright contour.
+            4. approxPolyDP that bright contour down to a quad.
+            5. Map that quad back to source-frame coordinates via the
+               inverse of the outer warp matrix.
+
+        If no inner quad is found, returns (None, 0.0) so the caller can
+        decide to keep the outer quad instead.
+        """
+        import logging  # local import to avoid touching module-level
+        logger = logging.getLogger(__name__)
+
+        outer = outer_corners.astype(np.float32)
+        tl, tr, br, bl = outer
+
+        # 1) compute outer warp rectangle size
+        width_a = np.linalg.norm(br - bl)
+        width_b = np.linalg.norm(tr - tl)
+        height_a = np.linalg.norm(tr - br)
+        height_b = np.linalg.norm(tl - bl)
+        out_w = int(max(width_a, width_b))
+        out_h = int(max(height_a, height_b))
+        if out_w < 20 or out_h < 20:
+            return None, 0.0
+
+        dst = np.array(
+            [
+                [0, 0],
+                [out_w - 1, 0],
+                [out_w - 1, out_h - 1],
+                [0, out_h - 1],
+            ],
+            dtype=np.float32,
+        )
+        M = cv2.getPerspectiveTransform(outer, dst)
+        warped = cv2.warpPerspective(frame_bgr, M, (out_w, out_h))
+        if warped is None or warped.size == 0:
+            return None, 0.0
+
+        # 2) bright-page mask.  In Lab / grayscale, paper reads > 200.
+        gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY) if warped.ndim == 3 else warped
+        # Adaptive: top 30% brightest pixels are "paper".
+        # This handles off-white paper, sepia paper, yellowed pages.
+        hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).ravel()
+        total = hist.sum()
+        if total <= 0:
+            return None, 0.0
+        cumulative = np.cumsum(hist)
+        # Find the gray value where the top 70% of pixels are below it.
+        bright_threshold = int(np.searchsorted(cumulative, total * 0.70))
+        bright_threshold = max(120, min(bright_threshold, 240))
+
+        mask = (gray >= bright_threshold).astype(np.uint8) * 255
+
+        # 3) close gaps in the bright region so we get a solid rectangle
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_ERODE, kernel, iterations=1)
+
+        bright_contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if not bright_contours:
+            logger.debug("inner-page: no bright contours found (thr=%d)", bright_threshold)
+            return None, 0.0
+
+        bright_contours = sorted(bright_contours, key=cv2.contourArea, reverse=True)
+        biggest = bright_contours[0]
+        if cv2.contourArea(biggest) < 0.20 * out_w * out_h:
+            # bright region is less than 20% of the warp -> not a page
+            logger.debug("inner-page: biggest bright area too small: %d", cv2.contourArea(biggest))
+            return None, 0.0
+
+        # 4) smooth -> approxPolyDP -> 4-corner convex quad
+        try:
+            hull = cv2.convexHull(biggest)
+        except cv2.error:
+            hull = biggest
+        peri = cv2.arcLength(hull, True)
+        quad_warped = None
+        for eps_factor in (0.02, 0.04, 0.06, 0.08, 0.12, 0.18):
+            approx = cv2.approxPolyDP(hull, eps_factor * peri, True)
+            if len(approx) == 4 and cv2.isContourConvex(approx):
+                quad_warped = approx.reshape(4, 2).astype(np.float32)
+                break
+            if len(approx) < 4:
+                break
+
+        if quad_warped is None:
+            rect = cv2.minAreaRect(hull)
+            quad_warped = cv2.boxPoints(rect).astype(np.float32)
+
+        # 5) map back to source-frame coordinates
+        quad_warped = quad_warped.reshape(4, 1, 2)
+        M_inv = cv2.getPerspectiveTransform(dst, outer)
+        quad_source = cv2.perspectiveTransform(quad_warped, M_inv)
+        quad_source = quad_source.reshape(4, 2).astype(np.float32)
+        ordered = self._reorder(quad_source)
+
+        # confidence: bright-area ratio within the outer warp
+        bright_area = float(cv2.contourArea(biggest))
+        conf = self._confidence(bright_area, float(out_w * out_h))
+        return ordered.astype(np.int32), float(conf)
+
     # ------------------------------------------------------------------ #
     # Internals
     # ------------------------------------------------------------------ #

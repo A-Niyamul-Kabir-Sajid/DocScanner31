@@ -123,8 +123,11 @@ class DocumentProcessor:
         h, w = frame_bgr.shape[:2]
         gray = self._to_grayscale(frame_bgr)
         blurred = self._gaussian_blur(gray)
-        contrast = self._clahe(blurred)
-        edges = self._auto_canny(contrast)
+        # IMPORTANT: do Canny on the *blurred* gray, NOT on CLAHE-boosted
+        # gray.  CLAHE pushes the median gray up to 127 which makes the
+        # auto-Canny upper threshold jump to ~190 and washes out the
+        # subtle page edges we actually want to detect.
+        edges = self._auto_canny(blurred)
         closed = self._dilate_then_erode(edges)
 
         detection = self._detect_corners(frame_bgr, gray, closed, w, h)
@@ -134,7 +137,12 @@ class DocumentProcessor:
             processed = self._fallback_center_crop(frame_bgr)
         else:
             warped = self._perspective_warp(frame_bgr, corners, w, h)
-            cropped = self._border_crop(warped)
+            # Apply CLAHE on the WARP (display/preview use), not on the
+            # detection input.  This keeps the median-based Canny thresholds
+            # stable while still giving the user a contrast-enhanced page.
+            contrast = self._clahe(cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)) if warped.ndim == 3 else self._clahe(warped)
+            enhanced = cv2.cvtColor(contrast, cv2.COLOR_GRAY2BGR) if warped.ndim == 3 else contrast
+            cropped = self._border_crop(enhanced)
             sized = self._resize_a4(cropped)
             cleaned = self._remove_shadow(sized) if self.shadow_removal else sized
             sharpened = self._sharpen(cleaned) if self.sharpen else cleaned
@@ -211,6 +219,19 @@ class DocumentProcessor:
         if corners is None:
             # Step 7 fallback: contour detection on the closed edge map.
             corners, confidence = self.corner_refiner.from_edges(edges, width, height)
+
+        # Step 7b: if the outer quad covers more than 35% of the frame,
+        # we probably picked up the book/cover.  Try to find the bright
+        # inner page so the warp crops the actual paper, not the cover.
+        if corners is not None:
+            outer_area = float(cv2.contourArea(corners.astype(np.float32).reshape(-1, 1, 2)))
+            if outer_area > 0.35 * width * height:
+                inner_corners, inner_conf = self.corner_refiner.refine_inner_page(
+                    frame_bgr, corners
+                )
+                if inner_corners is not None and inner_conf > 0.15:
+                    corners = inner_corners
+                    confidence = inner_conf
 
         return DetectionResult(
             corners=corners,
