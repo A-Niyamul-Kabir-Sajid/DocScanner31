@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Smart Document Scanner</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        :root { color-scheme: light dark; }
+        body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 1100px; }
+        h1   { margin-top: 0; }
+        .toolbar { display: flex; gap: .75rem; flex-wrap: wrap; margin: 1rem 0; }
+        button { padding: .55rem 1rem; font-size: 1rem; cursor: pointer; }
+        .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 1rem; }
+        .gallery figure { margin: 0; border: 1px solid #ccc; padding: .5rem; border-radius: 6px; background: #fafafa; }
+        .gallery img    { width: 100%; height: auto; display: block; }
+        figcaption       { font-size: .85rem; text-align: center; margin-top: .35rem; color: #555; }
+        .status          { padding: .5rem .75rem; border-radius: 4px; background: #eee; }
+        .status.ok       { background: #d4edda; }
+        .status.err      { background: #f8d7da; }
+        .badge           { display: inline-block; padding: .35rem .65rem; border-radius: 999px; background: #e7f1ff; color: #084c93; font-size: .9rem; }
+        button.danger    { background: #c0392b; color: white; border: none; border-radius: 4px; }
+        button.danger:hover { background: #a93226; }
+        button[disabled] { opacity: .6; cursor: progress; }
+    </style>
+</head>
+<body>
+    <h1>Smart Document Scanner</h1>
+    <p>
+        Capture pages with <kbd>C</kbd>, press <kbd>D</kbd> to save the current
+        session as <code>scan_N.pdf</code> and start a new one, then
+        <kbd>Q</kbd> to quit (you'll be asked whether to save first).
+    </p>
+
+    <div class="toolbar">
+        <button id="finishBtn" title="Save the current session as scan_N.pdf and start a new one">
+            Finish PDF (D)
+        </button>
+        <span class="badge">Session: <strong id="sessionCount">{{ session_pages }}</strong> page(s)</span>
+        <button id="quitBtn" class="danger" title="Save current pages (with confirm) and quit the app">
+            Quit (Q)
+        </button>
+        <input id="qrInput" type="text" placeholder="URL to encode in QR" size="40">
+        <button id="buildQrBtn">Build QR</button>
+    </div>
+
+    <div id="status" class="status" hidden></div>
+
+    <h2>Captured pages <small>(this session)</small></h2>
+    {% if pages %}
+        <div class="gallery">
+            {% for name in pages %}
+                <figure>
+                    <img src="{{ url_for('serve_capture', filename=name) }}" alt="{{ name }}">
+                    <figcaption>{{ name }}</figcaption>
+                </figure>
+            {% endfor %}
+        </div>
+    {% else %}
+        <p><em>No pages captured yet.</em></p>
+    {% endif %}
+
+    <h2>Saved PDFs</h2>
+    <ul>
+        {% if saved_pdfs %}
+            {% for name in saved_pdfs %}
+                <li><a href="{{ url_for('download_output', filename=name) }}">{{ name }}</a></li>
+            {% endfor %}
+        {% endif %}
+        {% if qr_exists %}
+            <li><a href="{{ url_for('download_output', filename='qrcode.png') }}">qrcode.png</a></li>
+        {% endif %}
+        {% if not saved_pdfs and not qr_exists %}
+            <li><em>None yet.</em></li>
+        {% endif %}
+    </ul>
+
+    <script>
+        const status = document.getElementById('status');
+        const sessionCount = document.getElementById('sessionCount');
+        function show(msg, ok = true) {
+            status.hidden = false;
+            status.textContent = msg;
+            status.className = 'status ' + (ok ? 'ok' : 'err');
+        }
+        async function post(url, body) {
+            const res = await fetch(url, { method: 'POST', body });
+            if (!res.ok) throw new Error((await res.text()) || res.statusText);
+            return res.json();
+        }
+        async function refreshPage() {
+            // Cheap refresh so the gallery + PDF list update after C/D actions.
+            window.location.reload();
+        }
+
+        document.getElementById('finishBtn').onclick = async () => {
+            const btn = document.getElementById('finishBtn');
+            btn.disabled = true;
+            try {
+                const r = await post('/finish');
+                show('PDF saved: ' + r.pdf_name + ' (' + r.session_pages + ' pages left)');
+                refreshPage();
+            } catch (e) {
+                show('Finish failed: ' + e.message, false);
+            } finally {
+                btn.disabled = false;
+            }
+        };
+
+        document.getElementById('quitBtn').onclick = async () => {
+            const pages = parseInt(sessionCount.textContent || '0', 10);
+            if (pages > 0) {
+                const ok = window.confirm(
+                    pages + ' page(s) are captured in this session.\n' +
+                    'Save them as scan_N.pdf before quitting?'
+                );
+                if (!ok) {
+                    const discard = window.confirm(
+                        'Discard the ' + pages + ' page(s) and quit without saving?'
+                    );
+                    if (!discard) return;  // user cancelled both
+                }
+            }
+            try {
+                await post('/quit');
+                show('Quitting… you can close this tab.');
+            } catch (e) {
+                show('Quit signal failed: ' + e.message, false);
+            }
+        };
+
+        document.getElementById('buildQrBtn').onclick = async () => {
+            const data = document.getElementById('qrInput').value.trim();
+            if (!data) { show('Enter a URL first.', false); return; }
+            const fd = new FormData(); fd.append('data', data);
+            try { const r = await post('/qr', fd); show('QR ready: ' + r.qr_url); }
+            catch (e) { show('QR failed: ' + e.message, false); }
+        };
+    </script>
+</body>
+</html>

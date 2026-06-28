@@ -1,0 +1,28 @@
+# Smart Document Scanner — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# Computer vision — used for camera capture, edge detection, perspective warp
+opencv-python>=4.8.0
+
+# Image processing — used for PDF generation and final touch-ups
+Pillow>=10.0.0
+
+# Numerical arrays — OpenCV uses it internally, but we also use it for geometry math
+numpy>=1.24.0
+
+# Web UI — serves the gallery + PDF download endpoint on localhost
+Flask>=3.0.0
+
+# QR code generator — embeds a download link onto the generated PDF
+qrcode>=7.4.0
+
+# Object detection model for document localization
+ultralytics>=8.0.0
+
+# PDF reader — used only by the smoke tests to verify generated PDFs
+pypdf>=4.0.0 ; python_version < "3.13"
+
+# ---------------------------------------------------------------------------
+# Optional — only needed when migrating to Raspberry Pi 5 + Camera Module 3
+# ---------------------------------------------------------------------------
+# picamera2>=0.3.12

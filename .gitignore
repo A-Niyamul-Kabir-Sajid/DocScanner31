@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+/.puku
+# Captured pages and generated outputs
+captures/*
+!captures/.gitkeep
+output/*
+!output/.gitkeep
