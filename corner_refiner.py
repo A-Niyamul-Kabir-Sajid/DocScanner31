@@ -70,8 +70,10 @@ class CornerRefiner:
         gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         v = float(np.median(blurred))
-        lower = int(max(0, 0.66 * v))
-        upper = int(min(255, 1.33 * v))
+        # Use a *floor* on the lower threshold so flat / bright frames (which
+        # otherwise produce a near-empty edge map) still get useful edges.
+        lower = int(max(20, 0.5 * v))
+        upper = int(min(255, max(lower + 30, 1.33 * v)))
         edges = cv2.Canny(blurred, lower, upper)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         edges = cv2.dilate(edges, kernel, iterations=1)
@@ -92,19 +94,38 @@ class CornerRefiner:
             return None, 0.0
 
         contours = sorted(contours, key=cv2.contourArea, reverse=True)
+        # Lower fallback threshold: 2% of the frame. We still produce a quad
+        # for the largest contour even if it is small so the user always
+        # gets *something* on the wire - the confidence score tells the
+        # quality gate how good it was.
+        soft_min_area = max(1.0, 0.02 * width * height)
         for cnt in contours[:8]:
             area = cv2.contourArea(cnt)
-            if area < min_area:
+            if area < soft_min_area:
                 continue
-            peri = cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-            if len(approx) == 4 and cv2.isContourConvex(approx):
-                corners = self._reorder(approx.reshape(4, 2))
-                confidence = self._confidence(area, width * height)
-                return corners.astype(np.int32), confidence
+            # Collapse noisy contour wiggles into the outer boundary *before*
+            # running approxPolyDP.  A doc outline with 1641 raw points will
+            # never reduce to 4 corners with polyDP alone because small
+            # zig-zags keep stealing vertices.  convexHull gives the true
+            # 4-corner polygon we want.
+            try:
+                hull = cv2.convexHull(cnt)
+            except cv2.error:
+                hull = cnt
+            hull_peri = cv2.arcLength(hull, True)
+            # Try progressively larger epsilons so a 10-pt hull can still
+            # collapse to a clean quad.
+            for eps_factor in (0.02, 0.04, 0.06, 0.08, 0.12, 0.18):
+                approx = cv2.approxPolyDP(hull, eps_factor * hull_peri, True)
+                if len(approx) == 4 and cv2.isContourConvex(approx):
+                    corners = self._reorder(approx.reshape(4, 2))
+                    confidence = self._confidence(area, width * height)
+                    return corners.astype(np.int32), confidence
+                if len(approx) < 4:
+                    break
         # Fallback: minimum-area rectangle of the largest contour.
         cnt = contours[0]
-        if cv2.contourArea(cnt) < min_area:
+        if cv2.contourArea(cnt) < soft_min_area:
             return None, 0.0
         rect = cv2.minAreaRect(cnt)
         box = cv2.boxPoints(rect)

@@ -164,10 +164,11 @@ class DocumentProcessor:
 
     @staticmethod
     def _auto_canny(gray: np.ndarray) -> np.ndarray:
-        # Step 5: auto Canny using median-based thresholds.
+        # Step 5: auto Canny using median-based thresholds with a floor
+        # so bright / low-contrast frames still produce useful edges.
         v = float(np.median(gray))
-        lower = int(max(0, 0.66 * v))
-        upper = int(min(255, 1.33 * v))
+        lower = int(max(30, 0.5 * v))
+        upper = int(min(255, max(lower + 40, 1.5 * v)))
         return cv2.Canny(gray, lower, upper)
 
     @staticmethod
