@@ -117,8 +117,21 @@ class DocumentProcessor:
         A4 crop of the original frame so the user always sees *something*
         on screen, but ``DetectionResult.confidence`` will be ``0.0``.
         """
+        return self.process_with_debug(frame_bgr)[:2]
+
+    def process_with_debug(self, frame_bgr: np.ndarray):
+        """Run the pipeline and return every intermediate frame.
+
+        Returns a tuple of
+        ``(processed, detection, gray, edges, contour_overlay,
+        biggest_contour_overlay, warped, warped_gray, adaptive)`` so the
+        UI can stream an 8-panel debug grid without re-running the steps.
+        Each frame is a 3-channel BGR image (single-channel stages are
+        converted for uniform handling).  All frames are the same height
+        as the input.
+        """
         if frame_bgr is None or frame_bgr.size == 0:
-            raise ValueError("process() received an empty frame")
+            raise ValueError("process_with_debug() received an empty frame")
 
         h, w = frame_bgr.shape[:2]
         gray = self._to_grayscale(frame_bgr)
@@ -130,8 +143,33 @@ class DocumentProcessor:
         detection = self._detect_corners(frame_bgr, gray, closed, w, h)
         corners = detection.corners
 
+        # All-contours overlay: every edge contour is drawn in green on
+        # the original frame so the user can see what the detector saw.
+        contour_overlay = frame_bgr.copy()
+        try:
+            all_contours, _ = cv2.findContours(
+                closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            cv2.drawContours(contour_overlay, all_contours, -1, (0, 255, 0), 2)
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+        # Biggest-contour overlay: only the four corners used for warping.
+        biggest_overlay = frame_bgr.copy()
+        if corners is not None:
+            cv2.polylines(
+                biggest_overlay,
+                [corners.astype(int).reshape(-1, 1, 2)],
+                isClosed=True,
+                color=(0, 255, 0),
+                thickness=3,
+            )
+            for (cx, cy) in corners.astype(int):
+                cv2.circle(biggest_overlay, (int(cx), int(cy)), 8, (0, 0, 255), -1)
+
         if corners is None:
             processed = self._fallback_center_crop(frame_bgr)
+            warped_bgr: Optional[np.ndarray] = None
         else:
             warped = self._perspective_warp(frame_bgr, corners, w, h)
             cropped = self._border_crop(warped)
@@ -139,8 +177,34 @@ class DocumentProcessor:
             cleaned = self._remove_shadow(sized) if self.shadow_removal else sized
             sharpened = self._sharpen(cleaned) if self.sharpen else cleaned
             processed = self._apply_scan_mode(sharpened)
+            warped_bgr = sized  # color warp before scan-mode tinting
 
-        return processed, detection
+        warped_gray_bgr: Optional[np.ndarray] = None
+        adaptive_bgr: Optional[np.ndarray] = None
+        if warped_bgr is not None:
+            warped_gray = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2GRAY)
+            warped_gray_bgr = cv2.cvtColor(warped_gray, cv2.COLOR_GRAY2BGR)
+            adaptive = cv2.adaptiveThreshold(
+                warped_gray,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                21,
+                10,
+            )
+            adaptive_bgr = cv2.cvtColor(adaptive, cv2.COLOR_GRAY2BGR)
+
+        return (
+            processed,
+            detection,
+            gray,
+            edges,
+            contour_overlay,
+            biggest_overlay,
+            warped_bgr,
+            warped_gray_bgr,
+            adaptive_bgr,
+        )
 
     # ------------------------------------------------------------------ #
     # Pipeline steps

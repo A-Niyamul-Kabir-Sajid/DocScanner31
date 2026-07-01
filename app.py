@@ -66,9 +66,19 @@ from config import (
 )
 from document_processor import DetectionResult, DocumentProcessor
 from flask_server import FlaskServer
+from image_grid import stack_images
 from pdf_builder import PDFBuilder, document_filename
 from quality_gate import QualityGate, QualityReport
 from qr_generator import QRGenerator
+
+# --------------------------------------------------------------------------- #
+# 8-panel debug-grid layout (matches the Murtaza-style pipeline view).
+# --------------------------------------------------------------------------- #
+DEBUG_GRID_LABELS: List[List[str]] = [
+    ["Original", "Gray", "Threshold", "Contours"],
+    ["Biggest Contour", "Warp Prespective", "Warp Gray", "Adaptive Threshold"],
+]
+DEBUG_GRID_SCALE: float = 0.5
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +126,51 @@ def _draw_text(
             thickness=-1,
         )
     cv2.putText(canvas, text, (x, y), font, scale, color, thickness, cv2.LINE_AA)
+
+
+# --------------------------------------------------------------------------- #
+# Grid-builder helpers (used by _render_live)
+# --------------------------------------------------------------------------- #
+def _to_bgr(img: np.ndarray) -> np.ndarray:
+    """Promote a single-channel stage to 3-channel BGR for stacking."""
+    if img is None:
+        raise ValueError("_to_bgr received None")
+    if img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    return img
+
+
+def _make_thumb(img: Optional[np.ndarray], size: int = 160) -> Optional[np.ndarray]:
+    """Return a centred square thumbnail (or ``None`` if input is unusable)."""
+    if img is None or img.size == 0:
+        return None
+    h, w = img.shape[:2]
+    scale = size / max(h, w, 1)
+    if scale <= 0:
+        return None
+    resized = cv2.resize(
+        img,
+        (max(1, int(w * scale)), max(1, int(h * scale))),
+        interpolation=cv2.INTER_AREA,
+    )
+    if resized.ndim == 2:
+        resized = cv2.cvtColor(resized, cv2.COLOR_GRAY2BGR)
+    canvas = np.zeros((size, size, 3), dtype=np.uint8)
+    y0 = (size - resized.shape[0]) // 2
+    x0 = (size - resized.shape[1]) // 2
+    canvas[y0 : y0 + resized.shape[0], x0 : x0 + resized.shape[1]] = resized
+    return canvas
+
+
+def grid_label_bottom(panels: Sequence[Sequence[object]], scale: float) -> int:
+    """Y-pixel of the bottom of the first (top) row's label header strip."""
+    if not panels or not panels[0]:
+        return 0
+    first = next((t for t in panels[0] if t is not None), None)
+    if first is None:
+        return 0
+    tile_h = int(first.shape[0] * scale)
+    return tile_h + 30  # 30 = label header strip height (matches stack_images)
 
 
 # --------------------------------------------------------------------------- #
@@ -466,17 +521,54 @@ class ScanSession:
 
         # Run the processor so the overlay reflects current detection state.
         try:
-            processed, detection = self.processor.process(frame)
-            canvas = DocumentProcessor.draw_overlay(frame, detection, processed_preview=processed)
+            (
+                processed,
+                detection,
+                gray,
+                edges,
+                contour_overlay,
+                biggest_overlay,
+                warped_bgr,
+                warped_gray_bgr,
+                adaptive_bgr,
+            ) = self.processor.process_with_debug(frame)
         except Exception:
-            canvas = frame.copy()
+            return self._render_live_fallback(frame)
 
-        # HUD
-        _draw_text(canvas, f"state: LIVE  pages: {self.page_count()}  mode: {self.scan_mode}",
-                   (10, 30), color=(0, 255, 0), bg=(0, 0, 0))
-        _draw_text(canvas,
-                   "[C] capture   [D] finish PDF   [M] cycle mode   [N] (after D)   [Q] quit",
-                   (10, 60), color=(255, 255, 255), bg=(0, 0, 0))
+        # Build the 8-panel debug grid.  Stages that are unavailable
+        # (no quad found => no warp) are filled with black tiles so the
+        # layout stays stable and the user can see what's missing.
+        blank = np.zeros_like(frame)
+        panels: List[List[Optional[np.ndarray]]] = [
+            [frame, _to_bgr(gray), _to_bgr(edges), contour_overlay],
+            [
+                biggest_overlay,
+                warped_bgr if warped_bgr is not None else blank,
+                warped_gray_bgr if warped_gray_bgr is not None else blank,
+                adaptive_bgr if adaptive_bgr is not None else blank,
+            ],
+        ]
+        try:
+            canvas = stack_images(panels, DEBUG_GRID_SCALE, DEBUG_GRID_LABELS)
+        except Exception:
+            return self._render_live_fallback(frame)
+
+        # HUD (drawn on top of the stacked grid - the canvas is wider/taller
+        # than the raw frame so coordinates are relative to the grid).
+        _draw_text(
+            canvas,
+            f"state: LIVE  pages: {self.page_count()}  mode: {self.scan_mode}  conf {detection.confidence:.2f}",
+            (10, 30),
+            color=(0, 255, 0),
+            bg=(0, 0, 0),
+        )
+        _draw_text(
+            canvas,
+            "[C] capture   [D] finish PDF   [M] cycle mode   [N] (after D)   [Q] quit",
+            (10, 60),
+            color=(255, 255, 255),
+            bg=(0, 0, 0),
+        )
         if self.last_message:
             _draw_text(canvas, self.last_message, (10, 90),
                        color=(0, 255, 255), bg=(0, 0, 0))
@@ -484,6 +576,7 @@ class ScanSession:
         # Live quality readout - always visible.  Turns orange when the
         # gate is currently rejecting (so the user knows why C did nothing),
         # green when the next C will succeed.
+        readout_y = grid_label_bottom(panels, DEBUG_GRID_SCALE) + 20
         if self.last_quality is not None:
             q = self.last_quality
             color = (0, 255, 0) if q.ok else (0, 140, 255)
@@ -492,17 +585,57 @@ class ScanSession:
                 f"quality: {q.reason or 'ok'} "
                 f"(blur={q.blur:.0f} bright={q.brightness:.0f} "
                 f"motion={q.motion:.1f}px)",
-                (10, 120),
+                (10, readout_y),
                 color=color,
                 bg=(0, 0, 0),
             )
         else:
-            _draw_text(canvas, "quality: -- (press C to sample)", (10, 120),
+            _draw_text(canvas, "quality: -- (press C to sample)", (10, readout_y),
                        color=(180, 180, 180), bg=(0, 0, 0))
+
+        # Thumb of the final processed page in the bottom-right of the grid,
+        # so the user can see what would be saved on C.
+        thumb = _make_thumb(processed, size=160)
+        if thumb is not None and canvas.shape[1] > thumb.shape[1] + 20:
+            tx = canvas.shape[1] - thumb.shape[1] - 20
+            ty = canvas.shape[0] - thumb.shape[0] - 20
+            canvas[ty : ty + thumb.shape[0], tx : tx + thumb.shape[1]] = thumb
+            cv2.rectangle(
+                canvas,
+                (tx - 2, ty - 2),
+                (tx + thumb.shape[1] + 2, ty + thumb.shape[0] + 2),
+                (255, 255, 255),
+                1,
+            )
+            _draw_text(canvas, "would save", (tx, ty - 8),
+                       color=(255, 255, 255), bg=(0, 0, 0), scale=0.5)
 
         if self.show_exit_modal:
             self._draw_exit_modal(canvas)
 
+        return canvas
+
+    # ------------------------------------------------------------------ #
+    def _render_live_fallback(self, frame: np.ndarray) -> np.ndarray:
+        """Single-tile fallback when ``process_with_debug`` or stacking fails."""
+        try:
+            processed, detection = self.processor.process(frame)
+            canvas = DocumentProcessor.draw_overlay(frame, detection, processed_preview=processed)
+        except Exception:
+            canvas = frame.copy()
+            _draw_text(canvas, "pipeline error - showing raw frame",
+                       (10, 30), color=(0, 0, 255), bg=(0, 0, 0))
+
+        _draw_text(canvas, f"state: LIVE  pages: {self.page_count()}  mode: {self.scan_mode}",
+                   (10, 60), color=(0, 255, 0), bg=(0, 0, 0))
+        _draw_text(canvas,
+                   "[C] capture   [D] finish PDF   [M] cycle mode   [N] (after D)   [Q] quit",
+                   (10, 90), color=(255, 255, 255), bg=(0, 0, 0))
+        if self.last_message:
+            _draw_text(canvas, self.last_message, (10, 120),
+                       color=(0, 255, 255), bg=(0, 0, 0))
+        if self.show_exit_modal:
+            self._draw_exit_modal(canvas)
         return canvas
 
     # ------------------------------------------------------------------ #
