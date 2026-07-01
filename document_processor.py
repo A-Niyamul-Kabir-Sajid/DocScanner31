@@ -202,10 +202,17 @@ class DocumentProcessor:
             if bbox is not None:
                 used_yolo = True
                 x, y, w, h = bbox
+                # Guard against out-of-bounds bbox values from the detector.
+                x = max(0, min(int(x), width))
+                y = max(0, min(int(y), height))
+                w = max(1, min(int(w), width - x))
+                h = max(1, min(int(h), height - y))
                 roi = frame_bgr[y : y + h, x : x + w]
                 if roi.size > 0:
                     corners, confidence = self.corner_refiner.refine(
-                        roi, frame_shape=(height, width)
+                        roi,
+                        frame_shape=(height, width),
+                        roi_offset=(x, y),
                     )
 
         if corners is None:

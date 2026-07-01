@@ -60,6 +60,7 @@ from config import (
     QR_DIR,
     RAW_DIR,
     RAW_PREFIX,
+    SCAN_MODE,
     SCANNED_DIR,
     WINDOW_TITLE,
 )
@@ -136,6 +137,7 @@ class ScanSession:
     camera_height: int = DEFAULT_CAMERA_HEIGHT
     web_host: str = DEFAULT_WEB_HOST
     web_port: int = DEFAULT_WEB_PORT
+    scan_mode: str = SCAN_MODE
 
     # Bookkeeping populated by __post_init__.
     scanned_dir: Path = field(init=False)
@@ -190,8 +192,11 @@ class ScanSession:
 
     @property
     def processor(self) -> DocumentProcessor:
-        if self._processor is None:
-            self._processor = DocumentProcessor()
+        if (
+            self._processor is None
+            or getattr(self._processor, "scan_mode", None) != self.scan_mode
+        ):
+            self._processor = DocumentProcessor(scan_mode=self.scan_mode)
         return self._processor
 
     @property
@@ -422,6 +427,13 @@ class ScanSession:
                 "save & quit?" if self.page_count() > 0 else "quit? (no pages captured)"
             )
             return
+        if ch in ("m", "M"):
+            order = ("color", "grayscale", "bw")
+            current = self.scan_mode if self.scan_mode in order else order[0]
+            self.scan_mode = order[(order.index(current) + 1) % len(order)]
+            self._processor = None  # force rebuild on next frame
+            self.last_message = f"scan mode -> {self.scan_mode}"
+            return
 
     # ------------------------------------------------------------------ #
     def _handle_pdf_view_key(self, ch: str) -> None:
@@ -460,10 +472,11 @@ class ScanSession:
             canvas = frame.copy()
 
         # HUD
-        _draw_text(canvas, f"state: LIVE  pages: {self.page_count()}", (10, 30),
-                   color=(0, 255, 0), bg=(0, 0, 0))
-        _draw_text(canvas, "[C] capture   [D] finish PDF   [N] (after D)   [Q] quit", (10, 60),
-                   color=(255, 255, 255), bg=(0, 0, 0))
+        _draw_text(canvas, f"state: LIVE  pages: {self.page_count()}  mode: {self.scan_mode}",
+                   (10, 30), color=(0, 255, 0), bg=(0, 0, 0))
+        _draw_text(canvas,
+                   "[C] capture   [D] finish PDF   [M] cycle mode   [N] (after D)   [Q] quit",
+                   (10, 60), color=(255, 255, 255), bg=(0, 0, 0))
         if self.last_message:
             _draw_text(canvas, self.last_message, (10, 90),
                        color=(0, 255, 255), bg=(0, 0, 0))
@@ -634,6 +647,9 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
         ),
     )
     p.add_argument("--backend", default="opencv", choices=["opencv", "picamera2"])
+    p.add_argument("--scan-mode", default=SCAN_MODE,
+                   choices=["color", "grayscale", "bw"],
+                   help="Output style for captured pages (default: %(default)s)")
     p.add_argument("--width", type=int, default=DEFAULT_CAMERA_WIDTH)
     p.add_argument("--height", type=int, default=DEFAULT_CAMERA_HEIGHT)
     p.add_argument("--no-quality-gate", action="store_true",
@@ -683,6 +699,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         camera_height=args.height,
         web_host=args.host,
         web_port=args.port,
+        scan_mode=args.scan_mode,
     )
 
     if args.no_quality_gate:

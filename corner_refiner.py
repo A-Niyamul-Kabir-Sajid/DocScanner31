@@ -19,6 +19,10 @@ from config import DOC_MIN_AREA_RATIO
 logger = logging.getLogger(__name__)
 
 Point = Tuple[int, int]
+# Quad is a 4x2 int array: rows are (tl, tr, br, bl), columns are (x, y).
+# Kept as a type alias so ``auto_capture_controller`` and ``stability_tracker``
+# can keep importing ``Quad`` from this module.
+Quad = np.ndarray
 
 
 class CornerRefiner:
@@ -34,24 +38,35 @@ class CornerRefiner:
         self,
         roi_bgr: np.ndarray,
         frame_shape: Optional[Tuple[int, int]] = None,
+        roi_offset: Optional[Tuple[int, int]] = (0, 0),
     ) -> Tuple[Optional[np.ndarray], float]:
         """Find ordered corners inside ``roi_bgr``.
 
-        ``frame_shape=(H, W)`` of the original frame, if provided, lets the
-        returned coordinates be in source-frame space.  Otherwise they are
-        relative to ``roi_bgr`` (useful for tests).
+        Returns corners in the **source-frame** coordinate system.  Pass
+        ``roi_offset=(x, y)`` (the top-left of the ROI inside the source
+        frame) so the returned corners are translated back into frame space;
+        ``frame_shape=(H, W)`` is used only to clip corners to the frame.
         """
         h, w = roi_bgr.shape[:2]
         edges = self._edges(roi_bgr)
         corners, confidence = self._approx_quad(edges, w, h)
         if corners is None:
             return None, 0.0
+
+        # Translate from ROI-local to source-frame coordinates.
+        if roi_offset is not None:
+            ox, oy = int(roi_offset[0]), int(roi_offset[1])
+            corners = corners.astype(np.float32)
+            corners[:, 0] += ox
+            corners[:, 1] += oy
+
+        # Optionally clip to the frame so the corners stay inside the image.
         if frame_shape is not None:
-            # Caller passed the ROI already cropped from the full frame; we
-            # currently do not know the offset here, so the caller must add it
-            # back.  This method intentionally keeps coordinates local.
-            pass
-        return corners, confidence
+            fh, fw = int(frame_shape[0]), int(frame_shape[1])
+            corners[:, 0] = np.clip(corners[:, 0], 0, fw - 1)
+            corners[:, 1] = np.clip(corners[:, 1], 0, fh - 1)
+
+        return corners.astype(np.int32), float(confidence)
 
     def from_edges(
         self,
