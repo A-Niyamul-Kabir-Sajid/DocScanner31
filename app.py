@@ -1,4 +1,4 @@
-"""Smart Document Scanner - top-level application + LIVE/PDF_VIEW FSM.
+﻿"""Smart Document Scanner - top-level application + LIVE/PDF_VIEW FSM.
 
 The scanner has two states:
 
@@ -48,8 +48,12 @@ import numpy as np
 
 from camera import Camera
 from config import (
+    DEFAULT_AUTO_CAPTURE_COOLDOWN,
+    DEFAULT_AUTO_CAPTURE_ENABLED,
     DEFAULT_CAMERA_HEIGHT,
     DEFAULT_CAMERA_WIDTH,
+    DEFAULT_STABLE_FRAMES,
+    DEFAULT_STABILITY_TOLERANCE,
     DEFAULT_WEB_HOST,
     DEFAULT_WEB_PORT,
     DOCUMENT_COUNTER_START,
@@ -64,6 +68,7 @@ from config import (
     SCANNED_DIR,
     WINDOW_TITLE,
 )
+from auto_capture_controller import AutoCaptureController
 from document_processor import DetectionResult, DocumentProcessor
 from flask_server import FlaskServer
 from image_grid import stack_images
@@ -235,6 +240,21 @@ class ScanSession:
     page_change_quad_jump_px: float = 35.0
     last_page_change: Optional[PageChangeEvent] = field(default=None, init=False)
 
+    # Auto-capture tuning knobs (CLI-overridable).  When
+    # ``auto_capture_enabled`` is True the LIVE loop will capture the
+    # current frame as soon as a document quad has been stable for
+    # ``auto_capture_stable_frames`` consecutive frames, then wait
+    # ``auto_capture_cooldown_s`` seconds before re-arming.
+    auto_capture_enabled: bool = DEFAULT_AUTO_CAPTURE_ENABLED
+    auto_capture_cooldown_s: float = DEFAULT_AUTO_CAPTURE_COOLDOWN
+    auto_capture_stable_frames: int = DEFAULT_STABLE_FRAMES
+    auto_capture_tolerance_px: float = DEFAULT_STABILITY_TOLERANCE
+    # Internal book-keeping for the HUD pill.
+    _auto_capture: Optional[AutoCaptureController] = field(default=None, init=False)
+    _auto_capture_phase: str = field(default="off", init=False)
+    _auto_capture_progress: tuple = field(default=(0, 0), init=False)
+    _auto_capture_cooldown_until: float = field(default=0.0, init=False)
+
     # ------------------------------------------------------------------ #
     def __post_init__(self) -> None:
         self.captures_dir = Path(self.captures_dir)
@@ -309,6 +329,20 @@ class ScanSession:
                 auto_bump=self.auto_page_change_bump,
             )
         return self._page_change_detector
+
+    @property
+    def auto_capture(self) -> AutoCaptureController:
+        """Lazy accessor so tests can monkey-patch ``_auto_capture``."""
+        if self._auto_capture is None:
+            self._auto_capture = AutoCaptureController(
+                enabled=self.auto_capture_enabled,
+                cooldown_seconds=self.auto_capture_cooldown_s,
+            )
+            # Tighten the inner StabilityTracker thresholds to match the
+            # ScanSession knobs (which may be overridden per-instance).
+            self._auto_capture.tracker.required_frames = self.auto_capture_stable_frames
+            self._auto_capture.tracker.tolerance = self.auto_capture_tolerance_px
+        return self._auto_capture
 
     # ------------------------------------------------------------------ #
     # Public FSM API
@@ -499,6 +533,121 @@ class ScanSession:
             return None
 
     # ------------------------------------------------------------------ #
+    def _maybe_auto_capture(self) -> None:
+        """Tick the auto-capture state machine on each LIVE render frame.
+
+        State machine:
+
+        * ``off``              - feature disabled.  Nothing happens.
+        * ``identifying``      - a quad is visible; we are waiting for
+                                 ``auto_capture_stable_frames`` consecutive
+                                 stable frames.  HUD shows progress
+                                 ("AUTO · identifying 5/12").
+        * ``cooldown``         - we just fired a capture.  We ignore
+                                 further stable frames until
+                                 ``auto_capture_cooldown_s`` seconds have
+                                 elapsed.  HUD shows a countdown
+                                 ("AUTO · captured p3 · next 0.8s").
+        * ``idle``             - enabled but no quad detected this frame.
+                                 HUD shows "AUTO · waiting for document".
+
+        On transition from ``identifying`` -> ``cooldown`` we also call
+        :meth:`capture_current_frame` so the just-stable frame is
+        appended to the PDF (going through the existing quality gate
+        and page-change pipeline).
+        """
+        if not self.auto_capture_enabled:
+            self._auto_capture_phase = "off"
+            self._auto_capture_progress = (0, 0)
+            return
+
+        # Pull a fresh frame and run detection.
+        ok, frame = self.camera.read()
+        if not ok or frame is None:
+            self._auto_capture_phase = "idle"
+            self._auto_capture_progress = (0, 0)
+            self.last_message = "AUTO \u00b7 waiting for camera"
+            return
+
+        try:
+            processed, detection = self.processor.process(frame)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("auto-capture processor failed: %s", exc)
+            self._auto_capture_phase = "idle"
+            return
+
+        quad = getattr(detection, "corners", None)
+
+        # While in cooldown we just show the countdown and skip detection.
+        now = time.monotonic()
+        if now < self._auto_capture_cooldown_until:
+            remaining = max(0.0, self._auto_capture_cooldown_until - now)
+            self._auto_capture_phase = "cooldown"
+            self._auto_capture_progress = (
+                int(self._auto_capture.tracker.stable_count),
+                self._auto_capture.tracker.required_frames,
+            )
+            self.last_message = (
+                f"AUTO \u00b7 waiting {remaining:.1f}s before next scan"
+            )
+            return
+
+        if quad is None:
+            self._auto_capture.tracker.reset()
+            self._auto_capture_phase = "idle"
+            self._auto_capture_progress = (0, self._auto_capture.tracker.required_frames)
+            self.last_message = "AUTO \u00b7 waiting for document"
+            return
+
+        # AutoCaptureController.should_capture() returns True ONLY when:
+        #   1) the quad has been stable for required_frames, AND
+        #   2) the cooldown has elapsed (we already checked above).
+        # The wrapper internally calls tracker.update(quad), so after
+        # the call the tracker reflects the current frame.
+        should_fire = self.auto_capture.should_capture(quad)
+        count = int(self._auto_capture.tracker.stable_count)
+        required = int(self._auto_capture.tracker.required_frames)
+
+        if should_fire:
+            # Trigger the same code path as pressing C.  This will also
+            # update the page-change baseline so a swap-in-the-middle
+            # gets noticed on the next iteration.
+            try:
+                ok_cap, msg_cap, _proc, _det = self.capture_current_frame(frame)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("auto-capture firing failed: %s", exc)
+                ok_cap, msg_cap = False, str(exc)
+
+            if ok_cap:
+                self._auto_capture_phase = "cooldown"
+                self._auto_capture_cooldown_until = (
+                    time.monotonic() + self.auto_capture_cooldown_s
+                )
+                self._auto_capture_progress = (required, required)
+                self.last_message = (
+                    f"AUTO \u00b7 captured page {self.page_count()} \u00b7 "
+                    f"next in {self.auto_capture_cooldown_s:.1f}s"
+                )
+                logger.info(
+                    "auto-captured page %d (cooldown %.1fs)",
+                    self.page_count(), self.auto_capture_cooldown_s,
+                )
+            else:
+                # Capture was rejected by quality gate - re-arm quickly
+                # but stay in identifying mode so we don't spam messages.
+                self._auto_capture_phase = "identifying"
+                self._auto_capture_progress = (count, required)
+                self.last_message = f"AUTO \u00b7 {msg_cap}"
+            return
+
+        # Not yet stable - just show progress.
+        self._auto_capture_phase = "identifying"
+        self._auto_capture_progress = (count, required)
+        self.last_message = (
+            f"AUTO \u00b7 identifying {count}/{required}"
+        )
+
+    # ------------------------------------------------------------------ #
     def finish_pdf(self) -> Optional[Path]:
         """Flush ``self.pages`` into a numbered PDF and a matching QR PNG."""
         if not self.pages:
@@ -547,6 +696,12 @@ class ScanSession:
             self.page_change_detector.reset()
         except Exception:  # pragma: no cover - defensive
             pass
+        # Drop the auto-capture lock so the next session starts fresh.
+        self._auto_capture_cooldown_until = 0.0
+        self._auto_capture_phase = "idle"
+        if self._auto_capture is not None:
+            self._auto_capture.tracker.reset()
+            self._auto_capture.last_capture_timestamp = 0.0
         return pdf_path
 
     # ------------------------------------------------------------------ #
@@ -568,6 +723,12 @@ class ScanSession:
         except Exception:  # pragma: no cover - defensive
             pass
         self.last_page_change = None
+        # Reset auto-capture so the new document starts in "identifying".
+        self._auto_capture_cooldown_until = 0.0
+        self._auto_capture_phase = "idle"
+        if self._auto_capture is not None:
+            self._auto_capture.tracker.reset()
+            self._auto_capture.last_capture_timestamp = 0.0
         self.state = ScannerState.LIVE_SCANNER_MODE
 
     # ------------------------------------------------------------------ #
@@ -722,10 +883,39 @@ class ScanSession:
             bg=(0, 0, 0),
         )
         if self.last_message:
-            _draw_text(canvas, self.last_message, (10, 90),
-                       color=(0, 255, 255), bg=(0, 0, 0))
-
-        # Live quality readout - always visible.  Turns orange when the
+            _draw_text(
+                canvas,
+                self.last_message,
+                (10, 90),
+                color=(0, 0, 0) if self.auto_capture_enabled else (255, 255, 255),
+                bg=(0, 0, 0) if not self.auto_capture_enabled else None,
+            )
+        # ------------------------------------------------------------------
+        # AUTO pill - only when the feature is on.
+        # ------------------------------------------------------------------
+        if self.auto_capture_enabled:
+            phase = self._auto_capture_phase
+            if phase == "cooldown":
+                pill_text = (
+                    f"AUTO \u2022 captured p{self.page_count()} "
+                    f"\u2022 cooldown {self.auto_capture_cooldown_s:.1f}s"
+                )
+                pill_color = (255, 255, 255)
+                pill_bg = (0, 170, 90)
+            elif phase == "identifying":
+                c, r = self._auto_capture_progress
+                pill_text = f"AUTO \u2022 identifying {c}/{r}"
+                pill_color = (255, 255, 255)
+                pill_bg = (0, 140, 255)
+            elif phase == "idle":
+                pill_text = "AUTO \u2022 waiting for document"
+                pill_color = (255, 255, 255)
+                pill_bg = (90, 90, 90)
+            else:
+                pill_text = ""
+                pill_bg = None
+            if pill_text:
+                _draw_text(canvas, pill_text, (10, 118), color=pill_color, bg=pill_bg)
         # gate is currently rejecting (so the user knows why C did nothing),
         # green when the next C will succeed.
         readout_y = grid_label_bottom(panels, DEBUG_GRID_SCALE) + 20
@@ -879,6 +1069,15 @@ class ScanSession:
         cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
         try:
             while not self.quit_requested:
+                # Tick the auto-capture state machine BEFORE rendering so
+                # the HUD pill shows the result of this frame's check.
+                if (
+                    self.auto_capture_enabled
+                    and self.state == ScannerState.LIVE_SCANNER_MODE
+                    and not self.show_exit_modal
+                ):
+                    self._maybe_auto_capture()
+
                 canvas = self.render()
                 cv2.imshow(WINDOW_TITLE, canvas)
                 key = cv2.waitKey(30) & 0xFF
@@ -957,6 +1156,15 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
                    help="Start the Flask gallery (default: on).")
     p.add_argument("--no-web", dest="web", action="store_false",
                    help="Do not start the Flask gallery.")
+    p.add_argument("--auto-capture", dest="auto_capture", action="store_true",
+                   default=None,
+                   help="Auto-capture when a stable contour is detected "
+                        "(default: off).")
+    p.add_argument("--no-auto-capture", dest="auto_capture", action="store_false",
+                   default=None,
+                   help="Disable auto-capture (default).")
+    p.add_argument("--auto-capture-cooldown", type=float, default=None,
+                   help="Seconds to wait between auto-captures (default: 1.5).")
     return p.parse_args(argv)
 
 
@@ -1005,6 +1213,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             gate = QualityGate(**overrides)
             session._quality_gate = gate
             logger.info("QualityGate overrides: %s", overrides)
+
+    # Auto-capture CLI overrides -------------------------------------------------
+    if getattr(args, "auto_capture", None) is True:
+        session.auto_capture_enabled = True
+    elif getattr(args, "auto_capture", None) is False:
+        session.auto_capture_enabled = False
+    if getattr(args, "auto_capture_cooldown", None) is not None:
+        session.auto_capture_cooldown_s = float(args.auto_capture_cooldown)
+    logger.info(
+        "AutoCapture: enabled=%s cooldown=%.2fs stable_frames=%d tolerance=%.1fpx",
+        session.auto_capture_enabled,
+        session.auto_capture_cooldown_s,
+        session.auto_capture_stable_frames,
+        session.auto_capture_tolerance_px,
+    )
 
     logger.info(
         "Starting scanner: source=%r backend=%s %dx%d web=%s host=%s port=%d",

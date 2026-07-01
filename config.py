@@ -81,8 +81,13 @@ CORNER_CONFIDENCE_MIN: float = 0.30
 # --------------------------------------------------------------------------- #
 # Auto capture
 # --------------------------------------------------------------------------- #
+# When enabled, the LIVE loop auto-captures the current frame whenever a
+# stable document contour has been observed for ``DEFAULT_STABLE_FRAMES``
+# consecutive frames.  After each capture the loop waits
+# ``DEFAULT_AUTO_CAPTURE_COOLDOWN`` seconds before re-arming so the user
+# has time to swap pages.
 DEFAULT_AUTO_CAPTURE_ENABLED: bool = False
-DEFAULT_AUTO_CAPTURE_COOLDOWN: float = 3.0
+DEFAULT_AUTO_CAPTURE_COOLDOWN: float = 1.5  # mid of the 1-2 s window the user asked for
 DEFAULT_STABLE_FRAMES: int = 12
 DEFAULT_STABILITY_TOLERANCE: float = 4.0   # pixels of corner drift tolerated
 
