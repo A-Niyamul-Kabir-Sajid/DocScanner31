@@ -67,6 +67,7 @@ from config import (
 from document_processor import DetectionResult, DocumentProcessor
 from flask_server import FlaskServer
 from image_grid import stack_images
+from page_change_detector import PageChangeDetector, PageChangeEvent
 from pdf_builder import PDFBuilder, document_filename
 from quality_gate import QualityGate, QualityReport
 from qr_generator import QRGenerator
@@ -216,9 +217,23 @@ class ScanSession:
     _pdf_builder: Optional[PDFBuilder] = field(default=None, init=False)
     _qr_generator: Optional[QRGenerator] = field(default=None, init=False)
     _flask_server: Optional[FlaskServer] = field(default=None, init=False)
+    _page_change_detector: Optional[PageChangeDetector] = field(default=None, init=False)
     _on_finish_callbacks: List[Callable[[Path], None]] = field(
         default_factory=list, init=False
     )
+
+    # Page-change tuning knobs (CLI-overridable).  These mirror the
+    # constants in config.py but are duplicated on the dataclass so
+    # tests can override them per-instance without monkey-patching
+    # module-level globals.
+    page_change_enabled: bool = True
+    auto_page_change_bump: bool = True
+    page_change_hash_distance: int = 10
+    page_change_motion_trigger_px: float = 25.0
+    page_change_motion_rest_px: float = 6.0
+    page_change_rest_frames: int = 6
+    page_change_quad_jump_px: float = 35.0
+    last_page_change: Optional[PageChangeEvent] = field(default=None, init=False)
 
     # ------------------------------------------------------------------ #
     def __post_init__(self) -> None:
@@ -280,6 +295,20 @@ class ScanSession:
         if self._flask_server is None:
             self._flask_server = FlaskServer(self, host=self.web_host, port=self.web_port)
         return self._flask_server
+
+    @property
+    def page_change_detector(self) -> PageChangeDetector:
+        if self._page_change_detector is None:
+            self._page_change_detector = PageChangeDetector(
+                enabled=self.page_change_enabled,
+                motion_trigger_px=self.page_change_motion_trigger_px,
+                motion_rest_px=self.page_change_motion_rest_px,
+                rest_frames=self.page_change_rest_frames,
+                quad_jump_px=self.page_change_quad_jump_px,
+                hash_distance=self.page_change_hash_distance,
+                auto_bump=self.auto_page_change_bump,
+            )
+        return self._page_change_detector
 
     # ------------------------------------------------------------------ #
     # Public FSM API
@@ -347,13 +376,127 @@ class ScanSession:
                 )
             except OSError:  # pragma: no cover - defensive
                 pass
+            # Still feed the page-change observer so we don't get stuck
+            # in IDLE forever just because the very first frame was rejected.
+            try:
+                self.page_change_detector.observe(
+                    quad=getattr(detection, "corners", None),
+                    processed_bgr=processed,
+                    motion_px=report.motion,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("page-change observe (rejected frame) failed: %s", exc)
             return False, f"rejected: {report.reason}", processed, detection
+
+        # ------------------------------------------------------------------
+        # Page-change detection -- runs ONLY on accepted frames so that the
+        # detector's baseline always reflects a real, scannable page.
+        # ------------------------------------------------------------------
+        page_change_event: Optional[PageChangeEvent] = None
+        try:
+            page_change_event = self.page_change_detector.observe(
+                quad=getattr(detection, "corners", None),
+                processed_bgr=processed,
+                motion_px=report.motion,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("page-change observe failed: %s", exc)
+
+        if page_change_event is not None:
+            self.last_page_change = page_change_event
+            swapped = self._on_page_change(page_change_event, processed)
+            if swapped is not None:
+                # _on_page_change already grabbed the new page via recursion
+                # (or failed to and we want to fall through to the normal
+                # capture path below as a safety net).
+                if swapped:
+                    return True, f"auto-bumped to page {self.page_count()}", processed, detection
+                # swapped == False means the user disabled auto-bump;
+                # capture THIS frame as page N so we keep momentum.
 
         # Save the page to disk (the canonical PDF source) and keep an in-mem copy.
         path = self.page_filename()
         cv2.imwrite(str(path), processed)
         self.pages.append(processed)
+
+        # Refresh the page-change baseline so the NEXT frame is compared
+        # against this just-captured page (not a stale one from minutes ago).
+        try:
+            self.page_change_detector.update_baseline_after_capture(
+                processed, getattr(detection, "corners", None)
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("page-change baseline update failed: %s", exc)
+
         return True, f"page {self.page_count()} captured", processed, detection
+
+    # ------------------------------------------------------------------ #
+    def _on_page_change(
+        self,
+        event: PageChangeEvent,
+        processed_bgr: np.ndarray,
+    ) -> Optional[bool]:
+        """React to a confirmed page swap.
+
+        * If ``auto_page_change_bump`` is True  -> wipe the in-session
+          captures, drop in-memory pages, drop a breadcrumb under
+          ``raw/auto_change_<ts>.reason.txt``, and recursively capture the
+          current frame so the new page is appended.
+        * If it's False -> just set ``last_message`` so the LIVE HUD can
+          prompt the user to press ``C``.
+
+        Returns ``True`` if a swap was performed, ``False`` if the user
+        disabled auto-bump, ``None`` if the recursive capture raised
+        (caller will fall through and capture the original frame).
+        """
+        if not self.auto_page_change_bump:
+            self.last_message = (
+                f"NEW PAGE detected (conf={event.confidence:.2f}) -- press C to capture"
+            )
+            logger.info("page-change detected but auto-bump disabled")
+            return False
+
+        try:
+            # Wipe scanned page_NNN.jpg so page indexing restarts cleanly.
+            for f in self.scanned_dir.glob(f"{PAGE_PREFIX}*.jpg"):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            self.pages = []
+
+            # Drop a breadcrumb so an offline reviewer can tell why the
+            # page counter restarted.
+            breadcrumb = self.raw_dir / f"auto_change_{int(time.time())}.reason.txt"
+            breadcrumb.parent.mkdir(parents=True, exist_ok=True)
+            breadcrumb.write_text(
+                f"auto page change\n"
+                f"confidence={event.confidence:.3f}\n"
+                f"hash_distance={event.hash_distance}\n"
+                f"quad_distance={event.quad_distance:.2f}\n"
+                f"motion_at_peak={event.motion_at_peak:.2f}\n",
+                encoding="utf-8",
+            )
+
+            self.last_message = (
+                f"NEW PAGE (conf={event.confidence:.2f}) -- capturing..."
+            )
+            logger.info(
+                "page-change auto-bump  conf=%.2f hash=%d quad=%.1fpx",
+                event.confidence, event.hash_distance, event.quad_distance,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("auto-bump cleanup failed: %s", exc)
+
+        # Now grab the new page so the user sees it land in the PDF list.
+        try:
+            ok, msg, _proc, _det = self.capture_current_frame()
+            if not ok:
+                self.last_message = f"new page detected but capture failed: {msg}"
+            return ok
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("recursive capture during auto-bump failed: %s", exc)
+            return None
 
     # ------------------------------------------------------------------ #
     def finish_pdf(self) -> Optional[Path]:
@@ -400,6 +543,10 @@ class ScanSession:
         # Reset for the next document.
         self.pages = []
         self.state = ScannerState.PDF_VIEW_MODE
+        try:
+            self.page_change_detector.reset()
+        except Exception:  # pragma: no cover - defensive
+            pass
         return pdf_path
 
     # ------------------------------------------------------------------ #
@@ -416,6 +563,11 @@ class ScanSession:
                 f.unlink()
             except OSError:
                 pass
+        try:
+            self.page_change_detector.reset()
+        except Exception:  # pragma: no cover - defensive
+            pass
+        self.last_page_change = None
         self.state = ScannerState.LIVE_SCANNER_MODE
 
     # ------------------------------------------------------------------ #

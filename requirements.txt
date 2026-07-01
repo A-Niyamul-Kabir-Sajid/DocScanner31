@@ -22,6 +22,10 @@ ultralytics>=8.0.0
 # PDF reader — used only by the smoke tests to verify generated PDFs
 pypdf>=4.0.0 ; python_version < "3.13"
 
+# Perceptual hashing — used by ``page_change_detector.py`` to confirm a new
+# page was placed under the camera (Hamming distance over 64-bit phash).
+imagehash>=4.3.1
+
 # ---------------------------------------------------------------------------
 # Optional — only needed when migrating to Raspberry Pi 5 + Camera Module 3
 # ---------------------------------------------------------------------------

@@ -87,6 +87,32 @@ DEFAULT_STABLE_FRAMES: int = 12
 DEFAULT_STABILITY_TOLERANCE: float = 4.0   # pixels of corner drift tolerated
 
 # --------------------------------------------------------------------------- #
+# Auto page-change detection
+# --------------------------------------------------------------------------- #
+# When enabled, ``PageChangeDetector`` watches the live pipeline for a
+# "stable -> moved -> stable-again" gesture AND a phash delta on the warped
+# A4 page.  On confirm it can auto-bump the in-session page counter and
+# surface a "new page detected" message on the LIVE overlay.
+PAGE_CHANGE_ENABLED: bool = True
+# Hamming distance (over 64 bits) between the previous captured page's
+# perceptual hash and the current one that qualifies as a *different* page.
+PAGE_CHANGE_HASH_DISTANCE: int = 10
+# Mean absolute pixel-difference that must be sustained before we declare
+# the page "moved".  Mirrors QualityGate.MOTION_MAX_PX but in the other
+# direction.
+PAGE_CHANGE_MOTION_TRIGGER_PX: float = 25.0
+# After a swap we wait until motion settles below this threshold for
+# PAGE_CHANGE_REST_FRAMES consecutive frames before re-arming.
+PAGE_CHANGE_MOTION_REST_PX: float = 6.0
+PAGE_CHANGE_REST_FRAMES: int = 6
+# Minimum corner-distance jump (px) required between the last stable quad
+# and the new stable quad for the displacement arm to fire.
+PAGE_CHANGE_QUAD_JUMP_PX: float = 35.0
+# Whether the detector is allowed to bump the page counter automatically.
+# Tests / demos can set this to False to observe events without side effects.
+AUTO_PAGE_CHANGE_BUMP: bool = True
+
+# --------------------------------------------------------------------------- #
 # PDF / QR file naming
 # --------------------------------------------------------------------------- #
 DOCUMENT_PREFIX: str = "document_"
@@ -137,6 +163,12 @@ class AppConfig:
     quality_gate_enabled: bool = QUALITY_GATE_ENABLED
     shadow_removal: bool = SHADOW_REMOVAL
     sharpen: bool = SHARPEN
+    page_change_enabled: bool = PAGE_CHANGE_ENABLED
+    page_change_hash_distance: int = PAGE_CHANGE_HASH_DISTANCE
+    page_change_motion_trigger_px: float = PAGE_CHANGE_MOTION_TRIGGER_PX
+    page_change_motion_rest_px: float = PAGE_CHANGE_MOTION_REST_PX
+    page_change_rest_frames: int = PAGE_CHANGE_REST_FRAMES
+    page_change_quad_jump_px: float = PAGE_CHANGE_QUAD_JUMP_PX
     extra: dict = field(default_factory=dict)
 
 
