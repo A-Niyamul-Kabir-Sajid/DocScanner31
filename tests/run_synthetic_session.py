@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import shutil
 import sys
+import time
 from pathlib import Path
 
 # Make ``python tests/run_synthetic_session.py`` work without installing.
@@ -153,6 +154,7 @@ def main() -> int:
         min_area_ratio=0.0,
         enabled=False,  # bypass - synthetic frames are clean by construction
     )
+    session.capture_controller.tracker.required_frames = 1
     print("[harness] pipeline ready.")
 
     assert session.state == ScannerState.LIVE_SCANNER_MODE, "should start in LIVE"
@@ -161,6 +163,8 @@ def main() -> int:
     print("[harness] session 1 - simulating C x3 ...")
     for i in range(1, 4):
         frame = grab_valid_frame(camera, processor)
+        session.capture_controller.tracker.stable_since = time.monotonic() - 2.5
+        session.capture_controller.tracker.stable_count = 3
         ok, msg, _proc, _det = session.capture_current_frame(frame)
         assert ok, f"C press {i} rejected: {msg}"
         assert session.page_count() == i, f"expected {i} pages, got {session.page_count()}"
@@ -185,6 +189,8 @@ def main() -> int:
 
     for i in range(2):
         frame = grab_valid_frame(camera, processor)
+        session.capture_controller.tracker.stable_since = time.monotonic() - 2.5
+        session.capture_controller.tracker.stable_count = 3
         ok, msg, _proc, _det = session.capture_current_frame(frame)
         assert ok, f"second-session C {i} rejected: {msg}"
         print(f"  - C pressed -> page_{i+1}.jpg  ({msg})")

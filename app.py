@@ -47,6 +47,7 @@ import cv2
 import numpy as np
 
 from camera import Camera
+from auto_capture_controller import AutoCaptureController
 from config import (
     DEFAULT_CAMERA_HEIGHT,
     DEFAULT_CAMERA_WIDTH,
@@ -156,6 +157,7 @@ class ScanSession:
     _camera: Optional[Camera] = field(default=None, init=False)
     _processor: Optional[DocumentProcessor] = field(default=None, init=False)
     _quality_gate: Optional[QualityGate] = field(default=None, init=False)
+    _capture_controller: Optional[AutoCaptureController] = field(default=None, init=False)
     _pdf_builder: Optional[PDFBuilder] = field(default=None, init=False)
     _qr_generator: Optional[QRGenerator] = field(default=None, init=False)
     _flask_server: Optional[FlaskServer] = field(default=None, init=False)
@@ -199,6 +201,12 @@ class ScanSession:
         if self._quality_gate is None:
             self._quality_gate = QualityGate()
         return self._quality_gate
+
+    @property
+    def capture_controller(self) -> AutoCaptureController:
+        if self._capture_controller is None:
+            self._capture_controller = AutoCaptureController(enabled=True, stable_seconds=2.0)
+        return self._capture_controller
 
     @property
     def pdf_builder(self) -> PDFBuilder:
@@ -271,6 +279,13 @@ class ScanSession:
             logger.warning("could not write raw frame to %s: %s", raw_path, exc)
 
         processed, detection = self.processor.process(frame)
+        if detection.corners is None:
+            self.capture_controller.tracker.reset()
+            self.last_message = "no stable document detected"
+            return False, self.last_message, processed, detection
+
+        now = time.monotonic()
+        self.capture_controller.tracker.update(detection.corners, now=now)
         report = self.quality_gate.evaluate(processed, detection, raw_frame_for_motion=frame)
         self.last_quality = report
         if not report.ok:
@@ -289,10 +304,22 @@ class ScanSession:
                 pass
             return False, f"rejected: {report.reason}", processed, detection
 
+        if not self.capture_controller.tracker.is_stable_for(
+            self.capture_controller.stable_seconds,
+            now=now,
+        ):
+            elapsed = 0.0
+            if self.capture_controller.tracker.stable_since is not None:
+                elapsed = now - self.capture_controller.tracker.stable_since
+            wait_left = max(0.0, self.capture_controller.stable_seconds - elapsed)
+            self.last_message = f"hold steady for {wait_left:.1f}s"
+            return False, self.last_message, processed, detection
+
         # Save the page to disk (the canonical PDF source) and keep an in-mem copy.
         path = self.page_filename()
         cv2.imwrite(str(path), processed)
         self.pages.append(processed)
+        self.capture_controller.last_capture_timestamp = now
         return True, f"page {self.page_count()} captured", processed, detection
 
     # ------------------------------------------------------------------ #
@@ -455,6 +482,10 @@ class ScanSession:
         # Run the processor so the overlay reflects current detection state.
         try:
             processed, detection = self.processor.process(frame)
+            if detection.corners is not None:
+                self.capture_controller.tracker.update(detection.corners)
+            else:
+                self.capture_controller.tracker.reset()
             canvas = DocumentProcessor.draw_overlay(frame, detection, processed_preview=processed)
         except Exception:
             canvas = frame.copy()
@@ -485,6 +516,23 @@ class ScanSession:
             )
         else:
             _draw_text(canvas, "quality: -- (press C to sample)", (10, 120),
+                       color=(180, 180, 180), bg=(0, 0, 0))
+
+        if self.capture_controller.tracker.is_stable:
+            now = time.monotonic()
+            elapsed = 0.0
+            if self.capture_controller.tracker.stable_since is not None:
+                elapsed = now - self.capture_controller.tracker.stable_since
+            remaining = max(0.0, self.capture_controller.stable_seconds - elapsed)
+            _draw_text(
+                canvas,
+                f"stability: {elapsed:.1f}s steady ({remaining:.1f}s to capture)",
+                (10, 150),
+                color=(0, 255, 0) if remaining <= 0 else (0, 200, 255),
+                bg=(0, 0, 0),
+            )
+        else:
+            _draw_text(canvas, "stability: waiting for a steady document", (10, 150),
                        color=(180, 180, 180), bg=(0, 0, 0))
 
         if self.show_exit_modal:
