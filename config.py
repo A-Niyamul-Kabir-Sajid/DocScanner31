@@ -38,12 +38,22 @@ DEFAULT_BACKEND: str = "opencv"           # "opencv" | "picamera2"
 # Document scanning pipeline
 # --------------------------------------------------------------------------- #
 SCAN_MODE: str = "color"                  # "color" | "grayscale" | "bw"
-A4_WIDTH_PX: int = 2480                   # 8.27 in * 300 dpi
-A4_HEIGHT_PX: int = 3508                  # 11.69 in * 300 dpi
+A4_WIDTH_PX: int = 1654                   # 8.27 in * 200 dpi  (long edge ~220 dpi A4)
+A4_HEIGHT_PX: int = 2339                  # 11.69 in * 200 dpi
 DOC_BORDER_CROP_PX: int = 20              # final crop after perspective warp
+# Maximum upscale ratio between the warped crop and the final A4-sized
+# output.  Phone cameras crop out a ~1000 px wide page; upscaling 2.4x to
+# 300 dpi A4 produced a soft, waxy result (Laplacian variance drops from
+# 300 -> 6).  Cap the upscale so the warped region is rendered at its
+# natural resolution whenever possible.
+MAX_UPSCALE_RATIO: float = 1.0            # 1.0 = never upscale; cap to source
 JPEG_QUALITY: int = 90
 SHADOW_REMOVAL: bool = False
 SHARPEN: bool = True
+# Hard sharpness floor that ALWAYS fires before a page lands in the PDF,
+# even when QUALITY_GATE_ENABLED is False.  50 catches the "6.0 variance
+# waxy upscale" failure mode while still accepting clean MJPEG streams.
+ABSOLUTE_BLUR_MIN_VARIANCE: float = 50.0
 
 # --------------------------------------------------------------------------- #
 # Flask / web UI
@@ -83,13 +93,20 @@ CORNER_CONFIDENCE_MIN: float = 0.30
 # --------------------------------------------------------------------------- #
 # When enabled, the LIVE loop auto-captures the current frame whenever a
 # stable document contour has been observed for ``DEFAULT_STABLE_FRAMES``
-# consecutive frames.  After each capture the loop waits
-# ``DEFAULT_AUTO_CAPTURE_COOLDOWN`` seconds before re-arming so the user
-# has time to swap pages.
-DEFAULT_AUTO_CAPTURE_ENABLED: bool = False
-DEFAULT_AUTO_CAPTURE_COOLDOWN: float = 1.5  # mid of the 1-2 s window the user asked for
-DEFAULT_STABLE_FRAMES: int = 12
-DEFAULT_STABILITY_TOLERANCE: float = 4.0   # pixels of corner drift tolerated
+# consecutive frames (~2 s at the default 30 ms LIVE tick).  After each
+# capture the loop waits ``DEFAULT_AUTO_CAPTURE_COOLDOWN`` seconds before
+# re-arming so the user has time to swap pages.
+DEFAULT_AUTO_CAPTURE_ENABLED: bool = True
+DEFAULT_AUTO_CAPTURE_COOLDOWN: float = 5.0  # 5 s window so the user has time to swap the page
+# ~2 s of stable corners at the 30 ms LIVE tick (33 fps * 2 s ~= 66 frames).
+# 45 frames keeps the UX snappy while still rejecting hand-held shake.
+DEFAULT_STABLE_FRAMES: int = 5   # user requested a 5-frame re-confirm window per cycle
+# Maximum corner drift (pixels) tolerated between consecutive frames.
+# YOLOv8n + approxPolyDP routinely jitters 8-15 px even when the document
+# is held still, so a tight 6 px threshold never lets the streak build.
+# 18 px is comfortably above that noise floor but still below the drift
+# you get from a slow hand swap (~40+ px).
+DEFAULT_STABILITY_TOLERANCE: float = 18.0
 
 # --------------------------------------------------------------------------- #
 # Auto page-change detection

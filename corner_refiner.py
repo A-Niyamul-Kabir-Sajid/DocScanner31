@@ -77,6 +77,22 @@ class CornerRefiner:
         """Same as :meth:`refine` but the caller already computed the edges."""
         return self._approx_quad(edges, width, height)
 
+    @staticmethod
+    def distance(q1: np.ndarray, q2: np.ndarray) -> float:
+        """Return the maximum corner drift (pixels) between two ordered quads.
+
+        Both quads must already be in the same 4x2 layout (rows = tl,tr,br,bl).
+        Returns ``inf`` if either quad is malformed so the stability tracker
+        can quickly reject it.
+        """
+        if q1 is None or q2 is None:
+            return float("inf")
+        a = np.asarray(q1, dtype=np.float32).reshape(-1, 2)
+        b = np.asarray(q2, dtype=np.float32).reshape(-1, 2)
+        if a.shape != (4, 2) or b.shape != (4, 2):
+            return float("inf")
+        return float(np.max(np.linalg.norm(a - b, axis=1)))
+
     # ------------------------------------------------------------------ #
     # Internals
     # ------------------------------------------------------------------ #

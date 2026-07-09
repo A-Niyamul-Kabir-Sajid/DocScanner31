@@ -48,6 +48,7 @@ import numpy as np
 
 from camera import Camera
 from config import (
+    ABSOLUTE_BLUR_MIN_VARIANCE,
     DEFAULT_AUTO_CAPTURE_COOLDOWN,
     DEFAULT_AUTO_CAPTURE_ENABLED,
     DEFAULT_CAMERA_HEIGHT,
@@ -394,8 +395,50 @@ class ScanSession:
             logger.warning("could not write raw frame to %s: %s", raw_path, exc)
 
         processed, detection = self.processor.process(frame)
+
+        # Hard gate: never persist a frame without detected corners. The
+        # previous behavior was to fall back to a center crop, which fed
+        # garbage (and visually convincing but blank) pages into the PDF.
+        detection_corners = getattr(detection, "corners", None)
+        if detection_corners is None:
+            self.last_quality = None
+            # Still observe the page-change detector with the *raw* quad
+            # signal (None) so a real quad later on can establish a baseline.
+            try:
+                self.page_change_detector.observe(
+                    quad=None,
+                    processed_bgr=processed,
+                    motion_px=0.0,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("page-change observe (no-doc) failed: %s", exc)
+            return False, "no document detected - hold page in frame", processed, detection
+
         report = self.quality_gate.evaluate(processed, detection, raw_frame_for_motion=frame)
         self.last_quality = report
+
+        # Hard sharpness floor that ALWAYS fires, even when the user's
+        # session has the soft quality gate disabled.  Catches the
+        # "waxy 6.0-variance upscaled" failure mode that was producing
+        # blurred pages in the PDF without any reject signal.
+        try:
+            import cv2 as _cv2  # local import keeps top-of-file untouched
+            gray = _cv2.cvtColor(processed, _cv2.COLOR_BGR2GRAY)
+            lap_var = float(_cv2.Laplacian(gray, _cv2.CV_64F).var())
+        except Exception:
+            lap_var = float(report.blur) if report else 0.0
+        if lap_var < ABSOLUTE_BLUR_MIN_VARIANCE:
+            self.last_quality = report
+            try:
+                reason_path = raw_path.with_suffix(".reason.txt")
+                reason_path.write_text(
+                    f"rejected: blur (abs floor) variance={lap_var:.1f}\n",
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+            return False, f"rejected: blurry ({lap_var:.0f}<{ABSOLUTE_BLUR_MIN_VARIANCE:.0f})", processed, detection
+
         if not report.ok:
             # Tag the raw file with the rejection reason so it's easy to triage.
             try:
@@ -566,7 +609,7 @@ class ScanSession:
         if not ok or frame is None:
             self._auto_capture_phase = "idle"
             self._auto_capture_progress = (0, 0)
-            self.last_message = "AUTO \u00b7 waiting for camera"
+            self.last_message = "AUTO | waiting for camera"
             return
 
         try:
@@ -579,24 +622,30 @@ class ScanSession:
         quad = getattr(detection, "corners", None)
 
         # While in cooldown we just show the countdown and skip detection.
+        # NOTE: always go through the `auto_capture` *property* so the
+        # controller is lazily constructed on the first call - touching the
+        # private `_auto_capture` attr directly would crash with
+        # `AttributeError: 'NoneType' object has no attribute 'tracker'`
+        # when the controller was never instantiated yet.
+        controller = self.auto_capture
         now = time.monotonic()
         if now < self._auto_capture_cooldown_until:
             remaining = max(0.0, self._auto_capture_cooldown_until - now)
             self._auto_capture_phase = "cooldown"
             self._auto_capture_progress = (
-                int(self._auto_capture.tracker.stable_count),
-                self._auto_capture.tracker.required_frames,
+                int(controller.tracker.stable_count),
+                controller.tracker.required_frames,
             )
             self.last_message = (
-                f"AUTO \u00b7 waiting {remaining:.1f}s before next scan"
+                f"AUTO | waiting {remaining:.1f}s before next scan"
             )
             return
 
         if quad is None:
-            self._auto_capture.tracker.reset()
+            controller.tracker.reset()
             self._auto_capture_phase = "idle"
-            self._auto_capture_progress = (0, self._auto_capture.tracker.required_frames)
-            self.last_message = "AUTO \u00b7 waiting for document"
+            self._auto_capture_progress = (0, controller.tracker.required_frames)
+            self.last_message = "AUTO | waiting for document"
             return
 
         # AutoCaptureController.should_capture() returns True ONLY when:
@@ -604,9 +653,9 @@ class ScanSession:
         #   2) the cooldown has elapsed (we already checked above).
         # The wrapper internally calls tracker.update(quad), so after
         # the call the tracker reflects the current frame.
-        should_fire = self.auto_capture.should_capture(quad)
-        count = int(self._auto_capture.tracker.stable_count)
-        required = int(self._auto_capture.tracker.required_frames)
+        should_fire = controller.should_capture(quad)
+        count = int(controller.tracker.stable_count)
+        required = int(controller.tracker.required_frames)
 
         if should_fire:
             # Trigger the same code path as pressing C.  This will also
@@ -624,8 +673,14 @@ class ScanSession:
                     time.monotonic() + self.auto_capture_cooldown_s
                 )
                 self._auto_capture_progress = (required, required)
+                # Drop the baseline so the next detection cycle starts
+                # from a blank slate - if the user swapped in a new page
+                # during the 5 s cooldown, its quad will look "different"
+                # on the first frame and reset stable_count to 1 instead
+                # of having to drift through 5 confirmation frames.
+                controller.tracker.reset()
                 self.last_message = (
-                    f"AUTO \u00b7 captured page {self.page_count()} \u00b7 "
+                    f"AUTO | captured page {self.page_count()} | "
                     f"next in {self.auto_capture_cooldown_s:.1f}s"
                 )
                 logger.info(
@@ -637,14 +692,14 @@ class ScanSession:
                 # but stay in identifying mode so we don't spam messages.
                 self._auto_capture_phase = "identifying"
                 self._auto_capture_progress = (count, required)
-                self.last_message = f"AUTO \u00b7 {msg_cap}"
+                self.last_message = f"AUTO | {msg_cap}"
             return
 
         # Not yet stable - just show progress.
         self._auto_capture_phase = "identifying"
         self._auto_capture_progress = (count, required)
         self.last_message = (
-            f"AUTO \u00b7 identifying {count}/{required}"
+            f"AUTO | identifying {count}/{required}"
         )
 
     # ------------------------------------------------------------------ #
@@ -776,6 +831,21 @@ class ScanSession:
         if ch == "c":
             ok, msg, _proc, _det = self.capture_current_frame()
             self.last_message = msg
+            # Manual capture behaves exactly like an auto-capture fire:
+            # arm the same cooldown + reset the FSM so the next detection
+            # cycle starts from scratch instead of inheriting the just-captured
+            # quad's "stable" counter.
+            if ok:
+                controller = self.auto_capture
+                controller.tracker.reset()
+                self._auto_capture_cooldown_until = (
+                    time.monotonic() + self.auto_capture_cooldown_s
+                )
+                self._auto_capture_phase = "cooldown"
+                self._auto_capture_progress = (
+                    controller.tracker.required_frames,
+                    controller.tracker.required_frames,
+                )
             return
         if ch == "d":
             if self.page_count() == 0:
@@ -897,18 +967,18 @@ class ScanSession:
             phase = self._auto_capture_phase
             if phase == "cooldown":
                 pill_text = (
-                    f"AUTO \u2022 captured p{self.page_count()} "
-                    f"\u2022 cooldown {self.auto_capture_cooldown_s:.1f}s"
+                    f"AUTO | captured p{self.page_count()} | "
+                    f"cooldown {self.auto_capture_cooldown_s:.1f}s"
                 )
                 pill_color = (255, 255, 255)
                 pill_bg = (0, 170, 90)
             elif phase == "identifying":
                 c, r = self._auto_capture_progress
-                pill_text = f"AUTO \u2022 identifying {c}/{r}"
+                pill_text = f"AUTO | identifying {c}/{r}"
                 pill_color = (255, 255, 255)
                 pill_bg = (0, 140, 255)
             elif phase == "idle":
-                pill_text = "AUTO \u2022 waiting for document"
+                pill_text = "AUTO | waiting for document"
                 pill_color = (255, 255, 255)
                 pill_bg = (90, 90, 90)
             else:
@@ -1158,13 +1228,21 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
                    help="Do not start the Flask gallery.")
     p.add_argument("--auto-capture", dest="auto_capture", action="store_true",
                    default=None,
-                   help="Auto-capture when a stable contour is detected "
-                        "(default: off).")
+                   help="Force auto-capture ON (default: on).")
     p.add_argument("--no-auto-capture", dest="auto_capture", action="store_false",
                    default=None,
-                   help="Disable auto-capture (default).")
+                   help="Disable auto-capture (default: enabled).")
     p.add_argument("--auto-capture-cooldown", type=float, default=None,
-                   help="Seconds to wait between auto-captures (default: 1.5).")
+                   help=("Seconds the FSM stays in 'cooldown' after each "
+                         "auto- or manual-capture before re-arming "
+                         "(default: 5.0)."))
+    p.add_argument("--auto-capture-stable", type=int, default=None,
+                   help=("Number of consecutive frames that must agree on "
+                         "the same quad before an auto-capture fires "
+                         "(default: 5, i.e. ~0.15 s at the 30 ms LIVE tick)."))
+    p.add_argument("--auto-capture-tolerance", type=float, default=None,
+                   help=("Maximum pixel drift between consecutive quads "
+                         "before the stability counter resets (default: 18)."))
     return p.parse_args(argv)
 
 
@@ -1221,6 +1299,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         session.auto_capture_enabled = False
     if getattr(args, "auto_capture_cooldown", None) is not None:
         session.auto_capture_cooldown_s = float(args.auto_capture_cooldown)
+    if getattr(args, "auto_capture_stable", None) is not None:
+        session.auto_capture_stable_frames = int(args.auto_capture_stable)
+    if getattr(args, "auto_capture_tolerance", None) is not None:
+        session.auto_capture_tolerance_px = float(args.auto_capture_tolerance)
     logger.info(
         "AutoCapture: enabled=%s cooldown=%.2fs stable_frames=%d tolerance=%.1fpx",
         session.auto_capture_enabled,

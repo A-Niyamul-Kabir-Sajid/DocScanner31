@@ -36,6 +36,7 @@ from config import (
     DOC_BORDER_CROP_PX,
     DOC_MIN_AREA_RATIO,
     ENABLE_YOLO,
+    MAX_UPSCALE_RATIO,
     SCAN_MODE,
     SHADOW_REMOVAL,
     SHARPEN,
@@ -81,6 +82,7 @@ class DocumentProcessor:
         enable_yolo: bool = ENABLE_YOLO,
         shadow_removal: bool = SHADOW_REMOVAL,
         sharpen: bool = SHARPEN,
+        max_upscale_ratio: float = MAX_UPSCALE_RATIO,
         detector=None,
         corner_refiner=None,
     ) -> None:
@@ -92,6 +94,7 @@ class DocumentProcessor:
         self.enable_yolo = enable_yolo
         self.shadow_removal = shadow_removal
         self.sharpen = sharpen
+        self.max_upscale_ratio = max_upscale_ratio
 
         # Lazy imports so the camera/scanner still runs without ultralytics.
         if detector is None:
@@ -168,7 +171,9 @@ class DocumentProcessor:
                 cv2.circle(biggest_overlay, (int(cx), int(cy)), 8, (0, 0, 255), -1)
 
         if corners is None:
-            processed = self._fallback_center_crop(frame_bgr)
+            # Detection failed - emit a visible "NO DOC" banner at A4 size
+            # so the user understands why nothing is being captured.
+            processed = self._fallback_no_doc_banner(frame_bgr)
             warped_bgr: Optional[np.ndarray] = None
         else:
             warped = self._perspective_warp(frame_bgr, corners, w, h)
@@ -333,12 +338,42 @@ class DocumentProcessor:
         return warped[b:-b, b:-b]
 
     def _resize_a4(self, cropped: np.ndarray) -> np.ndarray:
-        # Step 12: resize to A4 dimensions (portrait by default).
-        return cv2.resize(
-            cropped,
-            (self.target_width, self.target_height),
-            interpolation=cv2.INTER_CUBIC,
-        )
+        # Step 12: resize to A4 dimensions (portrait by default), but never
+        # upscale past ``max_upscale_ratio``.  Upscaling a 1000 px wide
+        # phone-camera crop to 2480 px wide A4 with INTER_CUBIC produces a
+        # soft, waxy result that looks blurry (Laplacian variance drops by
+        # 50x).  INTER_AREA is the right interpolator when downscaling.
+        ch, cw = cropped.shape[:2]
+        target_w, target_h = self.target_width, self.target_height
+        # Fit the cropped page into the A4 box while keeping aspect ratio.
+        scale_to_fit = min(target_w / max(cw, 1), target_h / max(ch, 1))
+        if scale_to_fit >= 1.0:
+            # Source is smaller than A4 - apply the upscale cap.
+            scale = min(scale_to_fit, max(1.0, float(self.max_upscale_ratio)))
+            interp = cv2.INTER_CUBIC
+        elif scale_to_fit >= 0.5:
+            # Source is within 2x of A4 - downscale to A4.
+            scale = scale_to_fit
+            interp = cv2.INTER_AREA
+        else:
+            # Source is *much* larger than A4 - downscale to A4 using a
+            # multi-step pass for sharpness.
+            return self._resize_downscale(cropped, target_w, target_h)
+        new_w = max(1, int(round(cw * scale)))
+        new_h = max(1, int(round(ch * scale)))
+        return cv2.resize(cropped, (new_w, new_h), interpolation=interp)
+
+    @staticmethod
+    def _resize_downscale(image: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
+        """Multi-step downscale so a huge source still ends up crisp at A4."""
+        current = image
+        while True:
+            ch, cw = current.shape[:2]
+            if ch <= target_h * 2 and cw <= target_w * 2:
+                return cv2.resize(current, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            new_w = max(target_w, cw // 2)
+            new_h = max(target_h, ch // 2)
+            current = cv2.resize(current, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
     @staticmethod
     def _remove_shadow(image: np.ndarray) -> np.ndarray:
@@ -391,27 +426,58 @@ class DocumentProcessor:
     # ------------------------------------------------------------------ #
     # Fallback when detection fails
     # ------------------------------------------------------------------ #
-    def _fallback_center_crop(self, frame_bgr: np.ndarray) -> np.ndarray:
-        """Center-crop the frame to a portrait ratio and resize to A4.
+    def _fallback_no_doc_banner(self, frame_bgr: np.ndarray) -> np.ndarray:
+        """Emit a visible "NO DOC" banner instead of a fake A4 page.
 
-        Used when no quadrilateral can be located - the user still sees a
-        preview, and the quality gate will (correctly) reject the capture.
+        Previously the pipeline silently produced a centered A4 crop that
+        looked like a real page - users thought the scanner had captured
+        something.  Now we paint a red "NO DOC" overlay on the original
+        frame and let the auto-capture FSM refuse to fire on this frame.
         """
-        h, w = frame_bgr.shape[:2]
-        target_ratio = self.target_height / self.target_width
-        if h / max(w, 1) > target_ratio:
-            new_w = int(h / target_ratio)
-            x0 = max(0, (w - new_w) // 2)
-            cropped = frame_bgr[:, x0 : x0 + new_w]
-        else:
-            new_h = int(w * target_ratio)
-            y0 = max(0, (h - new_h) // 2)
-            cropped = frame_bgr[y0 : y0 + new_h, :]
-        return cv2.resize(
-            cropped,
+        canvas = cv2.resize(
+            frame_bgr,
             (self.target_width, self.target_height),
             interpolation=cv2.INTER_AREA,
         )
+        # Red translucent wash so the failure is obvious at a glance.
+        overlay = canvas.copy()
+        cv2.rectangle(
+            overlay,
+            (0, 0),
+            (canvas.shape[1], canvas.shape[0]),
+            (0, 0, 160),
+            thickness=-1,
+        )
+        cv2.addWeighted(overlay, 0.25, canvas, 0.75, 0, canvas)
+        # Border + ASCII label (Hershey font).
+        cv2.rectangle(
+            canvas,
+            (40, 40),
+            (canvas.shape[1] - 40, canvas.shape[0] - 40),
+            (0, 0, 200),
+            thickness=6,
+        )
+        cv2.putText(
+            canvas,
+            "NO DOC DETECTED",
+            (80, canvas.shape[0] // 2),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.6,
+            (255, 255, 255),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            canvas,
+            "hold a page in frame, ensure good light",
+            (80, canvas.shape[0] // 2 + 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        return canvas
 
     # ------------------------------------------------------------------ #
     # Drawing helpers (used by app.py overlay)

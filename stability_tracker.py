@@ -14,6 +14,11 @@ class StabilityTracker:
 
     required_frames: int = 8
     tolerance: float = 20.0
+    # Drift between ``tolerance`` and ``tolerance * jitter_band`` is treated as
+    # detection noise: the streak is *paused* (count stays put, baseline keeps
+    # the previous quad) instead of being reset.  Above the band we assume the
+    # document genuinely moved and reset the counter to 1.
+    jitter_band: float = 2.5
     stable_count: int = 0
     last_quad: Optional[Quad] = None
     corner_refiner: CornerRefiner = field(default_factory=CornerRefiner)
@@ -32,7 +37,12 @@ class StabilityTracker:
         distance = self.corner_refiner.distance(self.last_quad, quad)
         if distance <= self.tolerance:
             self.stable_count += 1
+        elif distance <= self.tolerance * self.jitter_band:
+            # Detection jitter - keep the baseline, hold the count steady.
+            # (Without this band the count would reset on every YOLO hiccup.)
+            pass
         else:
+            # Real motion - start a fresh streak from this quad.
             self.last_quad = quad
             self.stable_count = 1
 
