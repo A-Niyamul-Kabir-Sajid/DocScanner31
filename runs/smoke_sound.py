@@ -417,6 +417,35 @@ def main() -> int:  # noqa: C901 - linear test, fine for a smoke harness
         vp._cache.clear()  # type: ignore[attr-defined]
         vp._cache_lock = __import__("threading").Lock()  # type: ignore[assignment]
 
+        # speak() now hands phrases to an async synthesis worker so the
+        # LIVE loop never blocks on SAPI5 / espeak.  In tests we must
+        # drain the queue before asserting how many synth calls fired.
+        def _drain() -> None:
+            """Wait for the synthesis worker to catch up, then return."""
+            import queue as _q
+            import time as _t
+
+            # spin up to 5s; the fake synth is instant.
+            deadline = _t.monotonic() + 5.0
+            while _t.monotonic() < deadline:
+                try:
+                    if vp._synth_queue.qsize() == 0 and not (
+                        vp._synth_thread is not None
+                        and vp._synth_thread.is_alive()
+                        and getattr(vp, "_in_flight", False)
+                    ):
+                        # Give worker one more pump to finalise dispatch.
+                        _t.sleep(0.05)
+                        if vp._synth_queue.qsize() == 0:
+                            return
+                except Exception:
+                    pass
+                _t.sleep(0.02)
+            raise AssertionError(
+                "synth worker did not drain within 5s "
+                f"(qsize={vp._synth_queue.qsize()})"
+            )
+
         # Drive each event once.  Every event should produce exactly one
         # synth call and exactly one _play_wav call.
         rendered_calls.clear()
@@ -437,6 +466,7 @@ def main() -> int:  # noqa: C901 - linear test, fine for a smoke harness
         for ev, fmt in events:
             rc = vp.speak(ev, **fmt)
             _check(rc is True, f"speak({ev!r}, **{fmt}) returns True")
+        _drain()
         _check(len(rendered_calls) == len(events),
                f"each event synthesised exactly once "
                f"(got {len(rendered_calls)} calls for {len(events)} events)")
@@ -450,6 +480,7 @@ def main() -> int:  # noqa: C901 - linear test, fine for a smoke harness
         for ev, fmt in events:
             rc = vp.speak(ev, **fmt)
             _check(rc is True, f"cache hit speak({ev!r}, **{fmt}) returns True")
+        _drain()
         _check(rendered_calls == [],
                f"cache hit -> zero synth calls (got {rendered_calls})")
         _check(played == [FAKE_WAV] * len(events),
@@ -460,12 +491,14 @@ def main() -> int:  # noqa: C901 - linear test, fine for a smoke harness
         vp._cache.clear()  # type: ignore[attr-defined]
         rendered_calls.clear()
         vp.speak("capture_rejected", reason="too dark")
+        _drain()
         _check(
             "too dark" in rendered_calls[0],
             f"capture_rejected interpolates reason="
             f"{rendered_calls[0]!r}",
         )
         vp.speak("document_saved", n=7)
+        _drain()
         _check(
             "7" in rendered_calls[-1],
             f"document_saved interpolates n= -> {rendered_calls[-1]!r}",

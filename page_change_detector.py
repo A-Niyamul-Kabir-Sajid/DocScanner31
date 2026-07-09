@@ -149,6 +149,38 @@ class PageChangeDetector:
                 self._phase = self._PHASE_ARMED
             return None
 
+    def peek_for_change(
+        self,
+        *,
+        quad: Optional[Quad],
+        motion_px: float,
+    ) -> bool:
+        """Read-only probe: would a page-change event fire on this frame?
+
+        Used by ``AutoCaptureController`` (via ``_maybe_auto_capture``)
+        to detect a "frame changed" signal *without* consuming the
+        event.  Returns True when the detector is past the
+        ARMED/MOVING/SETTLING phases AND the motion spike would
+        contribute to a future fire -- i.e. the user is clearly
+        moving the page.  Conservative: prefers a False negative
+        over a False positive so the controller doesn't re-arm
+        prematurely.
+        """
+        if not self.enabled:
+            return False
+        if self._phase == self._PHASE_IDLE:
+            return False
+        # While MOVING we are *certain* the user is moving the page;
+        # any motion spike is enough.
+        if self._phase == self._PHASE_MOVING:
+            return motion_px > self.motion_trigger_px
+        # While SETTLING we are waiting for a confirmed rest streak;
+        # flag a change only on a fresh motion spike (otherwise the
+        # detector has already committed to a page swap that's coming).
+        if self._phase == self._PHASE_SETTLING:
+            return motion_px > self.motion_trigger_px
+        return False
+
         # ---- Movement detected ----
         if motion_px > self.motion_trigger_px:
             self._peak_motion = max(self._peak_motion, motion_px)

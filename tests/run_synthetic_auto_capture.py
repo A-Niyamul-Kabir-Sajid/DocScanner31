@@ -33,7 +33,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
-from auto_capture_controller import AutoCaptureController  # noqa: E402
+from auto_capture_controller import AutoCaptureController, S1_SEEKING_STABLE  # noqa: E402
 from stability_tracker import StabilityTracker              # noqa: E402
 from corner_refiner import CornerRefiner                    # noqa: E402
 from app import ScanSession, ScannerState                   # noqa: E402
@@ -236,21 +236,23 @@ def phase5_session_state(tmp: Path) -> None:
     s.capture_current_frame = fake_capture   # type: ignore[assignment]
 
     # Reset state
-    s._auto_capture_phase = "idle"
-    s._auto_capture_cooldown_until = 0.0
+    s._auto_capture_phase = "S1_seeking"
     s.auto_capture.tracker.reset()
-    # Warm the controller past the startup cooldown
+    s.auto_capture.state = S1_SEEKING_STABLE
     s.auto_capture.last_capture_timestamp = time.monotonic() - 0.5
 
     # Walk through enough ticks to satisfy required_frames (5)
     fired = 0
     for _ in range(8):
         s._maybe_auto_capture()
-        if s._auto_capture_phase == "cooldown":
+        if s._auto_capture_phase in ("S2_cooling", "S2_waiting"):
             fired += 1
             break
-    assert_true(fired >= 1, "phase transitioned identifying -> cooldown")
-    assert_true(s._auto_capture_cooldown_until > 0, "cooldown timestamp set")
+    assert_true(fired >= 1, "phase transitioned S1_seeking -> S2_cooling")
+    assert_true(
+        s.auto_capture.last_capture_timestamp > 0,
+        "controller captured timestamp set",
+    )
     assert_true(s.last_message.startswith("AUTO"), "HUD last_message updated")
     assert_eq(fire_count["n"], 1, "fake_capture fired exactly once")
 
@@ -258,16 +260,40 @@ def phase5_session_state(tmp: Path) -> None:
     pre_fires = fire_count["n"]
     s._maybe_auto_capture()
     assert_eq(fire_count["n"], pre_fires, "no extra fire during cooldown")
-    assert_eq(s._auto_capture_phase, "cooldown", "still cooling")
+    assert_eq(s._auto_capture_phase, "S2_cooling", "still cooling")
 
-    # Wait out the cooldown, then a fresh stable window should produce fire+1
+    # 2-state FSM contract: cooldown expiry alone does NOT clear the
+    # gate.  The controller must stay in S2 until it sees a "frame
+    # changed" signal (page-change event, drift, motion spike, or
+    # quad disappeared).  Prove it:
     time.sleep(0.5)
     for _ in range(8):
         s._maybe_auto_capture()
-        if fire_count["n"] > pre_fires:
+    assert_eq(
+        fire_count["n"], pre_fires,
+        "no second fire while S2 still waiting for change",
+    )
+    assert_eq(s._auto_capture_phase, "S2_waiting",
+              "moved from S2_cooling to S2_waiting after timer")
+
+    # Now flip a change signal explicitly and confirm the FSM moves
+    # back to S1 (no fire yet - just the flip).
+    s.auto_capture.consume_change()
+    s._maybe_auto_capture()
+    assert_eq(s._auto_capture_phase, "S1_seeking",
+              "change signal flipped back to S1_seeking")
+
+    # Walk through a fresh stable streak to fire again.
+    pre_fires_2 = fire_count["n"]
+    for _ in range(8):
+        s._maybe_auto_capture()
+        if fire_count["n"] > pre_fires_2:
             break
-    assert_true(fire_count["n"] >= pre_fires + 1,
-                f"second fire after cooldown (was={pre_fires} now={fire_count['n']})")
+    assert_true(
+        fire_count["n"] >= pre_fires_2 + 1,
+        f"second fire after change signal "
+        f"(was={pre_fires_2} now={fire_count['n']})",
+    )
 
 
 # ------------------------------------------------------------------

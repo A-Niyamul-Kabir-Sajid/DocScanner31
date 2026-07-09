@@ -69,7 +69,7 @@ from config import (
     SCANNED_DIR,
     WINDOW_TITLE,
 )
-from auto_capture_controller import AutoCaptureController
+from auto_capture_controller import AutoCaptureController, S1_SEEKING_STABLE, S2_WAITING_FOR_CHANGE
 from document_processor import DetectionResult, DocumentProcessor
 from flask_server import FlaskServer
 from sound import SoundPlayer
@@ -293,7 +293,6 @@ class ScanSession:
     _auto_capture: Optional[AutoCaptureController] = field(default=None, init=False)
     _auto_capture_phase: str = field(default="off", init=False)
     _auto_capture_progress: tuple = field(default=(0, 0), init=False)
-    _auto_capture_cooldown_until: float = field(default=0.0, init=False)
 
     # ------------------------------------------------------------------ #
     def __post_init__(self) -> None:
@@ -376,7 +375,7 @@ class ScanSession:
         if self._auto_capture is None:
             self._auto_capture = AutoCaptureController(
                 enabled=self.auto_capture_enabled,
-                cooldown_seconds=self.auto_capture_cooldown_s,
+                s2_no_match_timeout_s=self.auto_capture_cooldown_s,
             )
             # Tighten the inner StabilityTracker thresholds to match the
             # ScanSession knobs (which may be overridden per-instance).
@@ -660,7 +659,11 @@ class ScanSession:
                 "page-change auto-bump  conf=%.2f hash=%d quad=%.1fpx",
                 event.confidence, event.hash_distance, event.quad_distance,
             )
-            self.speak("page_change", n=int(round(event.confidence * 100)))
+            # The page list was just reset above; announce the page
+            # number we're about to capture (1-indexed) instead of the
+            # detector confidence which was the previous, confusing
+            # value here.
+            self.speak("page_change", n=self.page_count() + 1)
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("auto-bump cleanup failed: %s", exc)
             self.speak("error", detail=str(exc))
@@ -678,27 +681,39 @@ class ScanSession:
 
     # ------------------------------------------------------------------ #
     def _maybe_auto_capture(self) -> None:
-        """Tick the auto-capture state machine on each LIVE render frame.
+        """Tick the two-state auto-capture FSM on each LIVE render frame.
 
-        State machine:
+        States (mirrored by ``AutoCaptureController.state``):
 
-        * ``off``              - feature disabled.  Nothing happens.
-        * ``identifying``      - a quad is visible; we are waiting for
-                                 ``auto_capture_stable_frames`` consecutive
-                                 stable frames.  HUD shows progress
-                                 ("AUTO · identifying 5/12").
-        * ``cooldown``         - we just fired a capture.  We ignore
-                                 further stable frames until
-                                 ``auto_capture_cooldown_s`` seconds have
-                                 elapsed.  HUD shows a countdown
-                                 ("AUTO · captured p3 · next 0.8s").
-        * ``idle``             - enabled but no quad detected this frame.
-                                 HUD shows "AUTO · waiting for document".
+        * **State 1 -- ``S1_SEEKING_STABLE``**  ("S1_seeking" on the HUD)
+          Watch the incoming frames; when the same quad has been visible
+          for ``auto_capture_stable_frames`` consecutive stable ticks,
+          fire a capture and drop into State 2.
 
-        On transition from ``identifying`` -> ``cooldown`` we also call
-        :meth:`capture_current_frame` so the just-stable frame is
-        appended to the PDF (going through the existing quality gate
-        and page-change pipeline).
+        * **State 2 -- ``S2_WAITING_FOR_CHANGE``**
+          Stay armed but refuse to fire until 2 continuous seconds have
+          passed during which the live quad is *not* similar to the
+          four-point contour that was saved at the moment of the last
+          capture.  A tick is "not similar" when any of these holds:
+
+              * the live quad is ``None`` (page left the frame);
+              * the per-frame motion spiked above
+                ``page_change_motion_trigger_px``;
+              * the quad drifted beyond ``auto_capture_tolerance_px``
+                from ``last_captured_quad``;
+              * the dedicated ``PageChangeDetector`` already saw a move
+                (this triggers an instant flip).
+
+          The first continuous no-match streak of ``s2_no_match_timeout_s``
+          seconds (default 2.0 s) flips the FSM back to State 1, ready
+          for the next auto-capture.  A manual ``c`` key-press from
+          State 2 captures again, overwrites ``last_captured_quad`` with
+          the freshly saved contour, and resets the no-match timer back
+          to zero -- the FSM stays in State 2.
+
+          There is no fixed cooldown: a similar quad on any tick resets
+          the no-match timer to 0, and the next non-match tick starts
+          the count over.
         """
         if not self.auto_capture_enabled:
             self._auto_capture_phase = "off"
@@ -708,7 +723,7 @@ class ScanSession:
         # Pull a fresh frame and run detection.
         ok, frame = self.camera.read()
         if not ok or frame is None:
-            self._auto_capture_phase = "idle"
+            self._auto_capture_phase = "S1_seeking"
             self._auto_capture_progress = (0, 0)
             self.last_message = "AUTO | waiting for camera"
             return
@@ -717,108 +732,181 @@ class ScanSession:
             processed, detection = self.processor.process(frame)
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("auto-capture processor failed: %s", exc)
-            self._auto_capture_phase = "idle"
+            self._auto_capture_phase = "S1_seeking"
             return
 
         quad = getattr(detection, "corners", None)
 
-        # While in cooldown we just show the countdown and skip detection.
-        # NOTE: always go through the `auto_capture` *property* so the
-        # controller is lazily constructed on the first call - touching the
-        # private `_auto_capture` attr directly would crash with
-        # `AttributeError: 'NoneType' object has no attribute 'tracker'`
-        # when the controller was never instantiated yet.
-        controller = self.auto_capture
-        now = time.monotonic()
-        if now < self._auto_capture_cooldown_until:
-            remaining = max(0.0, self._auto_capture_cooldown_until - now)
-            self._auto_capture_phase = "cooldown"
+        # Compute a cheap per-frame motion estimate for the FSM.  We
+        # diff the *processed* page against the in-memory copy of the
+        # last successful capture (when available) so it's both fast and
+        # representative of what the user would actually compare.
+        motion_px = self._quick_motion(processed)
+
+        # Probe the page-change detector's FSM WITHOUT consuming an
+        # event - the real ``observe(...)`` still runs inside
+        # ``capture_current_frame`` and may auto-bump the page counter.
+        try:
+            page_change_event = self.page_change_detector.peek_for_change(
+                quad=quad, motion_px=motion_px
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("page-change peek failed: %s", exc)
+            page_change_event = False
+
+        # Hand everything to the new two-state controller.  Always go
+        # through the `auto_capture` *property* so the controller is
+        # lazily constructed on the first call.
+        self.auto_capture.motion_trigger_px = self.page_change_motion_trigger_px
+        result = self.auto_capture.observe(
+            quad,
+            motion_px=motion_px,
+            page_change_event=page_change_event or None,
+        )
+
+        # Mirror FSM state onto the HUD-facing fields the rest of the
+        # UI / webserver / tests already read.
+        self._auto_capture_phase = result.phase
+        self._auto_capture_progress = (
+            int(result.progress[0]), int(result.progress[1])
+        )
+
+        if result.phase == "off":
+            return
+
+        # Document left the frame: re-arm the per-session "detect_start"
+        # chime flag so the next visible quad triggers a fresh blip.
+        # This was the legacy behaviour pre-FSM and is asserted by
+        # smoke_sound.p7_fsm_sound_hooks ("doc-disappeared re-arms the
+        # detect_start chime").
+        if quad is None:
+            self._sound_detect_start_played = False
+
+        # *** Fire path *** -- controller says "go" while still in S1.
+        # Execute the capture BEFORE we touch the phase/progress mirrors
+        # below so the queued capture uses the live detection context.
+        if result.should_fire:
+            self._fire_auto_capture(frame, result)
+            # _fire_auto_capture already updated _auto_capture_phase /
+            # _auto_capture_progress on success or pushed us back to
+            # S1 on rejection - nothing more to mirror here.
+            return
+
+        # Mirror FSM state onto the HUD-facing fields the rest of the
+        # UI / webserver / tests already read.
+        self._auto_capture_phase = result.phase
+        self._auto_capture_progress = (
+            int(result.progress[0]), int(result.progress[1])
+        )
+
+        # State 1 -- building streak.  Play "detected" once per session.
+        if result.phase == "S1_seeking":
+            if quad is not None and not self._sound_detect_start_played:
+                self._sound_detect_start_played = True
+                self.play_sound("detect_start")
+                self.speak("detected")
+            self.last_message = (
+                f"AUTO | S1 seeking {result.progress[0]}/{result.progress[1]}"
+            )
+            return
+
+        # State 2 -- post-fire.  The controller now returns two phase
+        # labels from State 2:
+        #   * "S2_match"   -- the live quad currently looks similar to
+        #                     the contour that was saved at capture
+        #                     time.  No-match timer stays at 0.
+        #   * "S2_waiting" -- live quad differs from the saved contour
+        #                     this tick; the 2 s no-match timer is
+        #                     accumulating.  The HUD shows the countdown
+        #                     so the user knows when State 1 returns.
+        if result.phase == "S2_match":
+            self.last_message = (
+                f"AUTO | captured p{self.page_count()} | "
+                f"same page (timer held)"
+            )
+            return
+
+        if result.phase == "S2_waiting":
+            remain = self.auto_capture.no_match_remaining
+            tail = "change detected" if result.change_detected else "waiting for change"
+            self.last_message = (
+                f"AUTO | captured p{self.page_count()} | "
+                f"{tail} {remain:.1f}s"
+            )
+            return
+
+        # Unknown phase label - leave the mirrors as the controller
+        # already set them and bail.
+        return
+
+    # ------------------------------------------------------------------ #
+    def _fire_auto_capture(
+        self, frame: np.ndarray, result: "ObserveResult"
+    ) -> None:
+        """Execute the capture path once ``AutoCaptureController.observe`` fires."""
+        try:
+            ok_cap, msg_cap, _proc, _det = self.capture_current_frame(frame)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("auto-capture firing failed: %s", exc)
+            ok_cap, msg_cap = False, str(exc)
+
+        if ok_cap:
+            self._auto_capture_phase = self.auto_capture.phase_label()
             self._auto_capture_progress = (
-                int(controller.tracker.stable_count),
-                controller.tracker.required_frames,
+                self.auto_capture.tracker.required_frames,
+                self.auto_capture.tracker.required_frames,
             )
             self.last_message = (
-                f"AUTO | waiting {remaining:.1f}s before next scan"
+                f"AUTO | captured page {self.page_count()} | "
+                f"state 2"
             )
-            return
+            logger.info(
+                "auto-captured page %d (no-match timeout %.1fs)",
+                self.page_count(), self.auto_capture.s2_no_match_timeout_s,
+            )
+            # Audio cues -- the user just heard state-1 say "ready";
+            # now play the capture click + verbal confirmation.
+            self.play_sound("detect_stable")
+            self.play_sound("capture")
+            self.speak("stable")
+            self.speak("capture_auto")
+        else:
+            # Capture was rejected by the quality gate.  Push the FSM
+            # back to State 1 so the next stable window gets another
+            # chance without spamming messages.
+            self.auto_capture.state = S1_SEEKING_STABLE
+            self.auto_capture.tracker.reset()
+            self._auto_capture_phase = "S1_seeking"
+            self._auto_capture_progress = (
+                self.auto_capture.tracker.stable_count,
+                self.auto_capture.tracker.required_frames,
+            )
+            self.last_message = f"AUTO | {msg_cap}"
+            self.speak("capture_rejected", reason=msg_cap)
 
-        if quad is None:
-            controller.tracker.reset()
-            self._auto_capture_phase = "idle"
-            self._auto_capture_progress = (0, controller.tracker.required_frames)
-            self.last_message = "AUTO | waiting for document"
-            # Doc just left the frame - re-arm the "first quad" cue so
-            # the next time we see one we beep again.
-            self._sound_detect_start_played = False
-            return
+    # ------------------------------------------------------------------ #
+    def _quick_motion(self, processed: np.ndarray) -> float:
+        """Cheap per-frame MAD against the last accepted page.
 
-        # First frame with a real quad in this session -> cue "detected".
-        if not self._sound_detect_start_played:
-            self._sound_detect_start_played = True
-            self.play_sound("detect_start")
-            self.speak("detected")
-
-        # AutoCaptureController.should_capture() returns True ONLY when:
-        #   1) the quad has been stable for required_frames, AND
-        #   2) the cooldown has elapsed (we already checked above).
-        # The wrapper internally calls tracker.update(quad), so after
-        # the call the tracker reflects the current frame.
-        should_fire = controller.should_capture(quad)
-        count = int(controller.tracker.stable_count)
-        required = int(controller.tracker.required_frames)
-
-        if should_fire:
-            # Trigger the same code path as pressing C.  This will also
-            # update the page-change baseline so a swap-in-the-middle
-            # gets noticed on the next iteration.
-            try:
-                ok_cap, msg_cap, _proc, _det = self.capture_current_frame(frame)
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("auto-capture firing failed: %s", exc)
-                ok_cap, msg_cap = False, str(exc)
-
-            if ok_cap:
-                self._auto_capture_phase = "cooldown"
-                self._auto_capture_cooldown_until = (
-                    time.monotonic() + self.auto_capture_cooldown_s
-                )
-                self._auto_capture_progress = (required, required)
-                # Drop the baseline so the next detection cycle starts
-                # from a blank slate - if the user swapped in a new page
-                # during the 5 s cooldown, its quad will look "different"
-                # on the first frame and reset stable_count to 1 instead
-                # of having to drift through 5 confirmation frames.
-                controller.tracker.reset()
-                self.last_message = (
-                    f"AUTO | captured page {self.page_count()} | "
-                    f"next in {self.auto_capture_cooldown_s:.1f}s"
-                )
-                logger.info(
-                    "auto-captured page %d (cooldown %.1fs)",
-                    self.page_count(), self.auto_capture_cooldown_s,
-                )
-                # Audio cues - chime once to confirm stability, then the
-                # capture click.  ``detect_stable`` plays first so the
-                # user gets two distinct audible events ("ready... click").
-                self.play_sound("detect_stable")
-                self.play_sound("capture")
-                self.speak("stable")
-                self.speak("capture_auto")
-            else:
-                # Capture was rejected by quality gate - re-arm quickly
-                # but stay in identifying mode so we don't spam messages.
-                self._auto_capture_phase = "identifying"
-                self._auto_capture_progress = (count, required)
-                self.last_message = f"AUTO | {msg_cap}"
-                self.speak("capture_rejected", reason=msg_cap)
-            return
-
-        # Not yet stable - just show progress.
-        self._auto_capture_phase = "identifying"
-        self._auto_capture_progress = (count, required)
-        self.last_message = (
-            f"AUTO | identifying {count}/{required}"
-        )
+        Returns 0.0 on the first frame of a session.  Used by the
+        auto-capture FSM to detect a "frame moved" signal in State 2
+        without paying for a full ``QualityGate.evaluate(...)`` call.
+        """
+        prev = getattr(self, "_last_accepted_processed", None)
+        if prev is None or prev.shape != processed.shape:
+            self._last_accepted_processed = processed
+            return 0.0
+        try:
+            import cv2 as _cv2  # local import keeps module import-time slim
+            import numpy as _np
+            diff = _cv2.absdiff(
+                _cv2.cvtColor(prev, _cv2.COLOR_BGR2GRAY) if prev.ndim == 3 else prev,
+                _cv2.cvtColor(processed, _cv2.COLOR_BGR2GRAY) if processed.ndim == 3 else processed,
+            )
+            self._last_accepted_processed = processed
+            return float(_np.mean(diff))
+        except Exception:  # pragma: no cover - defensive
+            return 0.0
 
     # ------------------------------------------------------------------ #
     def finish_pdf(self) -> Optional[Path]:
@@ -872,11 +960,12 @@ class ScanSession:
         except Exception:  # pragma: no cover - defensive
             pass
         # Drop the auto-capture lock so the next session starts fresh.
-        self._auto_capture_cooldown_until = 0.0
-        self._auto_capture_phase = "idle"
         if self._auto_capture is not None:
             self._auto_capture.tracker.reset()
             self._auto_capture.last_capture_timestamp = 0.0
+            self._auto_capture.state = S1_SEEKING_STABLE
+        self._auto_capture_phase = "S1_seeking"
+        self._auto_capture_progress = (0, 0)
         return pdf_path
 
     # ------------------------------------------------------------------ #
@@ -901,12 +990,13 @@ class ScanSession:
         except Exception:  # pragma: no cover - defensive
             pass
         self.last_page_change = None
-        # Reset auto-capture so the new document starts in "identifying".
-        self._auto_capture_cooldown_until = 0.0
-        self._auto_capture_phase = "idle"
+        # Reset auto-capture so the new document starts in S1.
         if self._auto_capture is not None:
             self._auto_capture.tracker.reset()
             self._auto_capture.last_capture_timestamp = 0.0
+            self._auto_capture.state = S1_SEEKING_STABLE
+        self._auto_capture_phase = "S1_seeking"
+        self._auto_capture_progress = (0, 0)
         self.state = ScannerState.LIVE_SCANNER_MODE
 
     # ------------------------------------------------------------------ #
@@ -954,17 +1044,18 @@ class ScanSession:
         if ch == "c":
             ok, msg, _proc, _det = self.capture_current_frame()
             self.last_message = msg
-            # Manual capture behaves exactly like an auto-capture fire:
-            # arm the same cooldown + reset the FSM so the next detection
-            # cycle starts from scratch instead of inheriting the just-captured
-            # quad's "stable" counter.
+            # Manual capture -- always succeeds as a capture, and the
+            # FSM moves into State 2.  In State 2 the controller will
+            # only flip back to State 1 after a continuous 2 s of "no
+            # similar contour".  ``register_capture`` records the new
+            # four-point contour (or clears the baseline if corners
+            # are unknown) and resets the no-match timer.
             if ok:
                 controller = self.auto_capture
-                controller.tracker.reset()
-                self._auto_capture_cooldown_until = (
-                    time.monotonic() + self.auto_capture_cooldown_s
+                controller.register_capture(
+                    _det.corners if _det is not None else None
                 )
-                self._auto_capture_phase = "cooldown"
+                self._auto_capture_phase = controller.phase_label()
                 self._auto_capture_progress = (
                     controller.tracker.required_frames,
                     controller.tracker.required_frames,
@@ -982,6 +1073,11 @@ class ScanSession:
             saved = self.finish_pdf()
             if saved is not None:
                 self.last_message = f"finished -> {saved.name}"
+                # Audible save cue: a short rising chime paired with the
+                # spoken "Document saved, N pages" so the user always
+                # hears confirmation even if the TTS is interrupted by
+                # the previous capture ka-chunk.
+                self.play_sound("detect_stable")
                 self.speak("document_saved", n=self.page_count())
             else:
                 self.speak("capture_rejected", reason=msg)
@@ -1377,7 +1473,7 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     p.add_argument("--auto-capture-stable", type=int, default=None,
                    help=("Number of consecutive frames that must agree on "
                          "the same quad before an auto-capture fires "
-                         "(default: 5, i.e. ~0.15 s at the 30 ms LIVE tick)."))
+                         "(default: 60, i.e. ~2.0 s at the 30 ms LIVE tick)."))
     p.add_argument("--auto-capture-tolerance", type=float, default=None,
                    help=("Maximum pixel drift between consecutive quads "
                          "before the stability counter resets (default: 18)."))

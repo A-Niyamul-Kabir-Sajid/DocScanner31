@@ -93,11 +93,12 @@ CORNER_CONFIDENCE_MIN: float = 0.30
 # --------------------------------------------------------------------------- #
 # When enabled, the LIVE loop auto-captures the current frame whenever a
 # stable document contour has been observed for ``DEFAULT_STABLE_FRAMES``
-# consecutive frames (~2 s at the default 30 ms LIVE tick).  After each
-# capture the loop waits ``DEFAULT_AUTO_CAPTURE_COOLDOWN`` seconds before
-# re-arming so the user has time to swap pages.
+# consecutive frames (~2 s at the default 30 ms LIVE tick, i.e. 60 frames).
+# After each capture the FSM parks in State 2 and only flips back to
+# State 1 after ``DEFAULT_AUTO_CAPTURE_COOLDOWN`` seconds of continuous
+# no-match, giving the user time to swap pages.
 DEFAULT_AUTO_CAPTURE_ENABLED: bool = True
-DEFAULT_AUTO_CAPTURE_COOLDOWN: float = 5.0  # 5 s window so the user has time to swap the page
+DEFAULT_AUTO_CAPTURE_COOLDOWN: float = 3.0  # 3 s no-match window in State 2 before flipping back to State 1
 
 # --------------------------------------------------------------------------- #
 # Audio cues - short WAV beeps for "doc detected / stable / captured".
@@ -112,8 +113,8 @@ DEFAULT_SOUND_ENABLED: bool = True
 DEFAULT_SOUND_VOLUME: float = 0.6  # 0.0 (silent) - 1.0 (full)
 DEFAULT_SOUND_SAMPLE_RATE: int = 22050
 # ~2 s of stable corners at the 30 ms LIVE tick (33 fps * 2 s ~= 66 frames).
-# 45 frames keeps the UX snappy while still rejecting hand-held shake.
-DEFAULT_STABLE_FRAMES: int = 5   # user requested a 5-frame re-confirm window per cycle
+# User requested a 2-second stability window before auto-capture fires.
+DEFAULT_STABLE_FRAMES: int = 10  # ~2 s at the 30 ms LIVE tick
 # Maximum corner drift (pixels) tolerated between consecutive frames.
 # YOLOv8n + approxPolyDP routinely jitters 8-15 px even when the document
 # is held still, so a tight 6 px threshold never lets the streak build.

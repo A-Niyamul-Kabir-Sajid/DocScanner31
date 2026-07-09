@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import subprocess
 import sys
 import tempfile
@@ -97,13 +98,27 @@ _PHRASE_TEMPLATES: Dict[str, str] = {
 
     # Session lifecycle
     "document_new":     "New document opened",
-    "document_saved":   "Document saved, {n} pages",
+    "document_saved":   "Document saved, {pages_n}",
     "document_export":  "Exported to {path}",
 
     # Shutdown / error
     "shutdown":         "Scanner shutting down",
     "error":            "Error, {detail}",
 }
+
+
+def _pages_n(n: int) -> str:
+    """Return ``"1 page"`` / ``"3 pages"`` etc. for spoken prompts.
+
+    Kept as a separate helper so callers that need both the spoken
+    form and the raw integer (e.g. for a log line) don't have to
+    duplicate the singular/plural rule.
+    """
+    try:
+        n_int = int(n)
+    except (TypeError, ValueError):
+        return str(n)
+    return "1 page" if n_int == 1 else f"{n_int} pages"
 
 
 # --------------------------------------------------------------------------- #
@@ -141,29 +156,81 @@ def _espeak_available() -> bool:
 # --------------------------------------------------------------------------- #
 # Synthesis
 # --------------------------------------------------------------------------- #
-def _synthesise_pyttsx3(text: str, *, rate_wpm: int) -> bytes:
-    """Render ``text`` to a WAV blob via :mod:`pyttsx3` (Windows)."""
-    import pyttsx3  # type: ignore[import-not-found]
+# Process-wide pyttsx3 engine.  ``pyttsx3.init()`` spins up a SAPI5
+# COM object and pumps several events; doing it on every phrase added
+# ~300-800 ms of latency to the first spoken prompt after a cache miss.
+# Sharing a single engine cuts that to a one-time cost at process start.
+_pyttsx3_engine = None          # type: ignore[var-annotated]
+_pyttsx3_lock = threading.Lock()
+_pyttsx3_rate: int = 0
 
-    engine = pyttsx3.init()
+
+def _coinit_for_pyttsx3() -> None:
+    """Initialise COM for the current thread before talking to SAPI5.
+
+    ``pyttsx3.init()`` spins up a SAPI5 COM object via comtypes.  comtypes
+    refuses to create the object unless ``CoInitialize`` / ``CoInitializeEx``
+    has already been called on the *same* thread (``WinError
+    -2147221008`` otherwise).  Our synth worker is a fresh Python daemon
+    thread, so we have to bootstrap COM on it ourselves.
+
+    The calls are no-ops when COM is already initialised on this thread
+    (idempotent), so calling this twice is safe.
+    """
     try:
-        engine.setProperty("rate", int(rate_wpm))
-        fd, path = tempfile.mkstemp(suffix=".wav")
+        import pythoncom  # type: ignore[import-not-found]
+        pythoncom.CoInitialize()
+    except Exception:  # pragma: no cover - pythoncom is a transitive dep of pyttsx3
+        # Fallback to comtypes' own bootstrap (also no-op when already done).
         try:
-            os.close(fd)
+            import comtypes  # type: ignore[import-not-found]
+            comtypes.CoInitialize()
+        except Exception:  # pragma: no cover
+            pass
+
+
+def _get_pyttsx3_engine(rate_wpm: int):
+    """Return the process-wide pyttsx3 engine, building it on first use."""
+    global _pyttsx3_engine, _pyttsx3_rate
+    if _pyttsx3_engine is None:
+        _coinit_for_pyttsx3()
+        import pyttsx3  # type: ignore[import-not-found]
+        engine = pyttsx3.init()
+        # Only stash a working engine.  ``pyttsx3.init()`` returns ``None``
+        # when COM isn't initialised; leaving that as the module global
+        # would make every subsequent call pretend it succeeded.
+        if engine is not None:
+            _pyttsx3_engine = engine
+            _pyttsx3_rate = int(rate_wpm)
+            _pyttsx3_engine.setProperty("rate", _pyttsx3_rate)
+    elif int(rate_wpm) != _pyttsx3_rate:
+        _pyttsx3_rate = int(rate_wpm)
+        _pyttsx3_engine.setProperty("rate", _pyttsx3_rate)
+    return _pyttsx3_engine
+
+
+def _synthesise_pyttsx3(text: str, *, rate_wpm: int) -> bytes:
+    """Render ``text`` to a WAV blob via :mod:`pyttsx3` (Windows).
+
+    The SAPI5 engine is shared across calls (one per process) so the
+    cost of ``pyttsx3.init()`` is paid once at startup, not on every
+    phrase.  A lock serialises concurrent calls because SAPI5 itself
+    is not thread-safe and our daemon-thread dispatch can fire several
+    requests in quick succession from a fast-moving FSM.
+    """
+    engine = _get_pyttsx3_engine(rate_wpm)
+    fd, path = tempfile.mkstemp(prefix="docscan_tts_", suffix=".wav")
+    try:
+        os.close(fd)
+        with _pyttsx3_lock:
             engine.save_to_file(text, path)
             engine.runAndWait()
-            with open(path, "rb") as f:
-                return f.read()
-        finally:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+        with open(path, "rb") as f:
+            return f.read()
     finally:
         try:
-            engine.stop()
-        except Exception:  # pragma: no cover - defensive
+            os.unlink(path)
+        except OSError:
             pass
 
 
@@ -234,6 +301,25 @@ class VoicePrompter:
         self._sound = sound_player if sound_player is not None else self._make_sound_player()
         self._cache: Dict[Tuple[str, str], bytes] = {}
         self._cache_lock = threading.Lock()
+        # Phrases for which we've already raised a WARNING because
+        # synthesis came back empty.  Prevents log spam if the backend
+        # is broken for the entire session.
+        self._synth_failure_warned: set = set()
+
+        # Synthesis worker thread.  SAPI5 / espeak are blocking calls
+        # (~200-800 ms per phrase) so we run them off the LIVE loop and
+        # cache the resulting WAV bytes for future hits.
+        self._synth_queue: "queue.Queue[Tuple[str, str] | None]" = queue.Queue()
+        self._synth_thread: Optional[threading.Thread] = None
+        self._synth_started = False
+        self._synth_lock = threading.Lock()
+
+        # Pre-warm the TTS engine off the constructor's critical path
+        # so the first speak() call doesn't pay the SAPI5 COM init cost
+        # (typically 300-800 ms on Windows).  Failures are silent; the
+        # first real speak() will retry the init lazily.
+        if self.enabled and self._backend_name == "pyttsx3":
+            self._prewarm_async()
 
         if self.enabled:
             logger.info(
@@ -269,6 +355,32 @@ class VoicePrompter:
         return "none", None
 
     # ------------------------------------------------------------------ #
+    def _prewarm_async(self) -> None:
+        """Spin up the pyttsx3 engine on a background thread.
+
+        SAPI5's ``init()`` cost is paid once on this thread, not when
+        the user is already mid-capture waiting for the first spoken
+        prompt.  Idempotent; a second prewarm is a no-op.
+        """
+        if not self.enabled or self._backend_name != "pyttsx3":
+            return
+
+        def _runner() -> None:
+            try:
+                _coinit_for_pyttsx3()
+                _get_pyttsx3_engine(self.rate_wpm)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("voice prewarm failed: %s", exc)
+            finally:
+                try:
+                    import pythoncom  # type: ignore[import-not-found]
+                    pythoncom.CoUninitialize()
+                except Exception:  # pragma: no cover
+                    pass
+
+        threading.Thread(target=_runner, daemon=True, name="voice-prewarm").start()
+
+    # ------------------------------------------------------------------ #
     @staticmethod
     def _make_sound_player() -> Optional[object]:
         """Return a :class:`sound.SoundPlayer` we can borrow ``_play_wav`` from.
@@ -302,6 +414,13 @@ class VoicePrompter:
         if template is None:
             logger.debug("speak(%r): unknown event, ignoring", event)
             return None
+        # Convenience: if the caller passes ``n`` to a template that wants
+        # ``pages_n`` (or ``page_n``), translate automatically.  This
+        # keeps ``app.speak("document_saved", n=count)`` natural.
+        if "pages_n" in template and "pages_n" not in fmt and "n" in fmt:
+            fmt = {**fmt, "pages_n": _pages_n(fmt["n"])}
+        if "page_n" in template and "page_n" not in fmt and "n" in fmt:
+            fmt = {**fmt, "page_n": _pages_n(fmt["n"])}
         try:
             return template.format(**fmt)
         except KeyError as exc:
@@ -327,23 +446,91 @@ class VoicePrompter:
 
     # ------------------------------------------------------------------ #
     def _get_or_render(self, event: str, phrase: str) -> Optional[bytes]:
-        """Return cached WAV for ``(event, phrase)`` or render + cache it."""
+        """Return cached WAV for ``(event, phrase)``; never synthesise here.
+
+        On a miss this returns ``None`` and the caller is expected to
+        enqueue a synthesis job via :meth:`speak`.  Keeping the LIVE
+        hot path off the SAPI5/espeak critical section is the whole
+        point of the worker thread.
+        """
         key = (event, phrase)
         with self._cache_lock:
             wav = self._cache.get(key)
-            if wav is not None:
-                return wav
-        wav = self._synthesise(phrase)
-        if wav is None:
-            return None
-        with self._cache_lock:
-            # Double-checked; another thread may have raced us.
-            self._cache.setdefault(key, wav)
         return wav
+
+    # ------------------------------------------------------------------ #
+    def _ensure_worker(self) -> None:
+        """Start the synthesis worker thread on first use."""
+        with self._synth_lock:
+            if self._synth_started:
+                return
+            self._synth_started = True
+            self._synth_thread = threading.Thread(
+                target=self._synth_worker,
+                daemon=True,
+                name="voice-synth",
+            )
+            self._synth_thread.start()
+
+    # ------------------------------------------------------------------ #
+    def _synth_worker(self) -> None:
+        """Drain the synthesis queue forever.
+
+        For each ``(event, phrase)`` request:
+          1. Skip if the phrase is already cached.
+          2. Otherwise call the backend to render WAV bytes.
+          3. Stash in the cache so future speak() calls of the same
+             phrase return synchronously.
+          4. Hand the bytes to the shared audio backend (async).
+        """
+        _coinit_for_pyttsx3()
+        while True:
+            item = self._synth_queue.get()
+            if item is None:
+                self._synth_queue.task_done()
+                return
+            event, phrase = item
+            try:
+                key = (event, phrase)
+                with self._cache_lock:
+                    wav = self._cache.get(key)
+                if wav is None:
+                    wav = self._synthesise(phrase)
+                    if wav is None:
+                        # Surface silent backend failures to the user at
+                        # WARNING level exactly once per phrase, so a
+                        # regression like the CoInitialize bug doesn't
+                        # disappear into the DEBUG logs again.
+                        if key not in self._synth_failure_warned:
+                            self._synth_failure_warned.add(key)
+                            logger.warning(
+                                "voice synth returned no audio for %r "
+                                "(phrase=%r); further failures of this "
+                                "phrase will stay at DEBUG level",
+                                event, phrase,
+                            )
+                        else:
+                            logger.debug(
+                                "voice synth returned no audio for %r "
+                                "(phrase=%r)", event, phrase,
+                            )
+                        continue
+                    with self._cache_lock:
+                        # Double-checked; another worker may have raced.
+                        self._cache.setdefault(key, wav)
+                self._dispatch(wav)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("voice worker iteration failed: %s", exc)
+            finally:
+                self._synth_queue.task_done()
 
     # ------------------------------------------------------------------ #
     def speak(self, event: str, **fmt) -> bool:
         """Speak the phrase for ``event``.  Returns True if dispatched.
+
+        Hot path: render the template, return cached WAV immediately,
+        or enqueue a background synthesis job and return True.  The
+        LIVE loop never blocks on SAPI5 / espeak.
 
         Parameters
         ----------
@@ -362,26 +549,47 @@ class VoicePrompter:
             return False
 
         wav = self._get_or_render(event, phrase)
-        if wav is None:
-            return False
+        if wav is not None:
+            # Cache hit: dispatch straight to the audio backend, also
+            # off the LIVE loop.  Playback itself is async in
+            # SoundPlayer._play_wav.
+            threading.Thread(
+                target=self._dispatch,
+                args=(wav,),
+                daemon=True,
+                name="voice-play",
+            ).start()
+            return True
 
-        return self._dispatch(wav)
+        # Cache miss: enqueue a background synthesis + dispatch.
+        self._ensure_worker()
+        try:
+            self._synth_queue.put_nowait((event, phrase))
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("voice enqueue failed; dropping %r", event)
+            return False
+        return True
 
     # ------------------------------------------------------------------ #
     def _dispatch(self, wav: bytes) -> bool:
-        """Hand ``wav`` to the shared audio backend (daemon thread)."""
+        """Hand ``wav`` to the shared audio backend.  Already async."""
         if self._sound is None:
             logger.debug("voice dispatch: no SoundPlayer available")
             return False
+        try:
+            self._sound._play_wav(wav)  # type: ignore[attr-defined]
+            return True
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("voice dispatch failed: %s", exc)
+            return False
 
-        def _runner() -> None:
-            try:
-                self._sound._play_wav(wav)  # type: ignore[attr-defined]
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.debug("voice dispatch failed: %s", exc)
-
-        threading.Thread(target=_runner, daemon=True).start()
-        return True
+    # ------------------------------------------------------------------ #
+    def shutdown(self) -> None:
+        """Stop the synthesis worker.  Safe to call multiple times."""
+        try:
+            self._synth_queue.put_nowait(None)
+        except Exception:  # pragma: no cover - defensive
+            pass
 
 
 # --------------------------------------------------------------------------- #
