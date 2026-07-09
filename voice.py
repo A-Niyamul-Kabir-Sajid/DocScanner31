@@ -100,6 +100,7 @@ _PHRASE_TEMPLATES: Dict[str, str] = {
     "document_new":     "New document opened",
     "document_saved":   "Document saved, {pages_n}",
     "document_export":  "Exported to {path}",
+    "page_deleted":     "Last page removed",
 
     # Shutdown / error
     "shutdown":         "Scanner shutting down",

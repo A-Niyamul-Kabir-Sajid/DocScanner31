@@ -16,6 +16,9 @@ Key map (case-insensitive):
     LIVE_SCANNER_MODE
         C - capture current frame (quality-gate enforced)
         D - flush pages -> PDF + QR + Flask server -> PDF_VIEW_MODE
+        X - delete the last captured page (in-memory + on-disk),
+            renumber the remaining pages so the next PDF stays
+            contiguous.  No-op when there are no captured pages.
         N - rejected (must D first)
         Q - if any pages captured: auto D, then modal Exit? Y/N
             else: modal Exit? Y/N
@@ -24,6 +27,10 @@ Key map (case-insensitive):
         N - reset pages, bump doc counter, return to LIVE_SCANNER_MODE
         Q - modal Exit? Y/N
         C/D - ignored
+
+The LIVE canvas also renders a thumbnail of the most recently captured
+page (bottom-left) so the user can see what would currently be removed
+by pressing ``X``.
 
 Modal Exit dialog:
     Y - quit the application
@@ -1091,6 +1098,122 @@ class ScanSession:
         return pages
 
     # ------------------------------------------------------------------ #
+    def delete_last_page(self) -> bool:
+        """Drop the most recently captured page from the in-session buffer.
+
+        Pops ``self.pages[-1]`` and deletes the matching ``page_NNN.jpg``
+        (plus its raw sibling ``raw_NNN.jpg`` and any ``.reason.txt``
+        breadcrumb) from disk.  Remaining pages are renumbered on disk so
+        the next ``D`` press still produces a contiguous PDF.
+
+        Returns ``True`` when a page was removed, ``False`` when there
+        was nothing to delete.
+        """
+        if not self.pages:
+            self.last_message = "no pages to delete"
+            return False
+
+        removed_index = len(self.pages)              # 1-indexed slot being dropped
+        removed_image = self.pages.pop()
+        del removed_image  # free the numpy buffer eagerly
+
+        # Capture the rest as a snapshot (so we can renumber without
+        # touching the in-memory order) and then rewrite the on-disk
+        # files to match the new 1..N indexing.  Use the *contents* of
+        # self.pages so memory is the source of truth.
+        snapshot = list(self.pages)
+
+        # 1) Delete the file that used to be at ``removed_index``.
+        for prefix, directory in (
+            (PAGE_PREFIX, self.scanned_dir),
+            (RAW_PREFIX, self.raw_dir),
+        ):
+            stale = directory / f"{prefix}{removed_index}.jpg"
+            if stale.exists():
+                try:
+                    stale.unlink()
+                except OSError as exc:  # pragma: no cover - defensive
+                    logger.debug("could not delete %s: %s", stale, exc)
+            reason = stale.with_suffix(".reason.txt")
+            if reason.exists():
+                try:
+                    reason.unlink()
+                except OSError:
+                    pass
+
+        # 2) Shift everything after the removed slot down by one to
+        #    keep the numbering contiguous.  We do this by reading each
+        #    stale file and writing it to its new path; this also
+        #    drops the in-memory numpy copies that were staler than
+        #    the snapshots the user kept.
+        for new_idx in range(removed_index, len(snapshot) + 1):
+            old_path_scanned = self.scanned_dir / f"{PAGE_PREFIX}{new_idx + 1}.jpg"
+            new_path_scanned = self.scanned_dir / f"{PAGE_PREFIX}{new_idx}.jpg"
+            if old_path_scanned.exists():
+                try:
+                    old_path_scanned.rename(new_path_scanned)
+                except OSError as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "rename %s -> %s failed: %s",
+                        old_path_scanned, new_path_scanned, exc,
+                    )
+
+            old_path_raw = self.raw_dir / f"{RAW_PREFIX}{new_idx + 1}.jpg"
+            new_path_raw = self.raw_dir / f"{RAW_PREFIX}{new_idx}.jpg"
+            if old_path_raw.exists():
+                try:
+                    old_path_raw.rename(new_path_raw)
+                except OSError as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "rename %s -> %s failed: %s",
+                        old_path_raw, new_path_raw, exc,
+                    )
+
+            # Move the matching rejection-reason breadcrumb too.
+            old_reason = (self.raw_dir / f"{RAW_PREFIX}{new_idx + 1}.jpg").with_suffix(
+                ".reason.txt"
+            )
+            new_reason = (self.raw_dir / f"{RAW_PREFIX}{new_idx}.jpg").with_suffix(
+                ".reason.txt"
+            )
+            if old_reason.exists():
+                try:
+                    old_reason.rename(new_reason)
+                except OSError:
+                    pass
+
+        # 3) Re-seed the auto-capture baseline against the new "last
+        #    page" so the page-change detector doesn't immediately
+        #    declare a swap just because we deleted a frame.
+        if self.pages:
+            new_last = self.pages[-1]
+            corners = None
+            try:
+                # Best-effort: ask the processor to reprocess the last
+                # page so the page-change detector has a fresh quad.
+                _processed, det = self.processor.process(new_last)
+                corners = getattr(det, "corners", None)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("reprocess last page for baseline failed: %s", exc)
+            try:
+                self.page_change_detector.update_baseline_after_capture(
+                    new_last, corners
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("baseline reset after delete failed: %s", exc)
+        else:
+            try:
+                self.page_change_detector.reset()
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+        self.last_message = (
+            f"deleted last page (now {self.page_count()} page(s))"
+        )
+        logger.info("deleted last page; %d remain", self.page_count())
+        return True
+
+    # ------------------------------------------------------------------ #
     # Key dispatch
     # ------------------------------------------------------------------ #
     def handle_key(self, key: int) -> None:
@@ -1164,6 +1287,15 @@ class ScanSession:
         if ch == "n":
             # N is only valid in PDF_VIEW.  Stay in LIVE and tell the user.
             self.last_message = "press D first to finish this document"
+            return
+        if ch == "x":
+            if self.delete_last_page():
+                # Soft "undo" cue so the user hears confirmation even if
+                # they're not looking at the HUD.
+                self.play_sound("capture_rejected")
+                self.speak("page_deleted")
+            else:
+                self.last_message = "no pages to delete"
             return
         if ch == "q":
             self.show_exit_modal = True
@@ -1263,7 +1395,7 @@ class ScanSession:
         )
         _draw_text(
             canvas,
-            "[C] capture   [D] finish PDF   [M] cycle mode   [N] (after D)   [Q] quit",
+            "[C] capture   [D] finish PDF   [X] delete last page   [M] cycle mode   [N] (after D)   [Q] quit",
             (10, 60),
             color=(255, 255, 255),
             bg=(0, 0, 0),
@@ -1337,6 +1469,26 @@ class ScanSession:
             )
             _draw_text(canvas, "would save", (tx, ty - 8),
                        color=(255, 255, 255), bg=(0, 0, 0), scale=0.5)
+
+        # Thumb of the last successfully captured page in the bottom-left
+        # so the user has a visible confirmation of which page ``X`` will
+        # delete.  Falls back to a small "no pages yet" plaque when the
+        # session is empty.
+        last_thumb = _make_thumb(self.pages[-1], size=160) if self.pages else None
+        if last_thumb is not None and canvas.shape[0] > last_thumb.shape[0] + 20:
+            lx = 20
+            ly = canvas.shape[0] - last_thumb.shape[0] - 20
+            canvas[ly : ly + last_thumb.shape[0], lx : lx + last_thumb.shape[1]] = last_thumb
+            cv2.rectangle(
+                canvas,
+                (lx - 2, ly - 2),
+                (lx + last_thumb.shape[1] + 2, ly + last_thumb.shape[0] + 2),
+                (255, 220, 80),
+                2,
+            )
+            label = f"last page ({self.page_count()}) - [X] deletes"
+            _draw_text(canvas, label, (lx, ly - 8),
+                       color=(255, 220, 80), bg=(0, 0, 0), scale=0.5)
 
         if self.show_exit_modal:
             self._draw_exit_modal(canvas)
@@ -1450,7 +1602,7 @@ class ScanSession:
         _draw_text(canvas, f"state: LIVE  pages: {self.page_count()}  mode: {self.scan_mode}",
                    (10, 60), color=(0, 255, 0), bg=(0, 0, 0))
         _draw_text(canvas,
-                   "[C] capture   [D] finish PDF   [M] cycle mode   [N] (after D)   [Q] quit",
+                   "[C] capture   [D] finish PDF   [X] delete last page   [M] cycle mode   [N] (after D)   [Q] quit",
                    (10, 90), color=(255, 255, 255), bg=(0, 0, 0))
         if self.last_message:
             _draw_text(canvas, self.last_message, (10, 120),
@@ -1546,6 +1698,19 @@ class ScanSession:
     def run(self) -> None:
         """Open the camera and pump the FSM until quit."""
         cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
+        # Default the OpenCV window to fullscreen so the LIVE / PDF_VIEW
+        # canvases fill the screen.  ``WINDOW_FULLSCREEN`` keeps the OS
+        # title bar hidden and is supported on Windows / macOS / Linux.
+        # If the platform rejects the property (some headless / WSL setups)
+        # the window simply stays in its normal (resizable) state.
+        try:
+            cv2.setWindowProperty(
+                WINDOW_TITLE,
+                cv2.WND_PROP_FULLSCREEN,
+                cv2.WINDOW_FULLSCREEN,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("could not enable fullscreen window: %s", exc)
         try:
             while not self.quit_requested:
                 # Camera heartbeat FIRST: keeps the "retry in X.Xs"

@@ -36,6 +36,9 @@
             Finish PDF (D)
         </button>
         <span class="badge">Session: <strong id="sessionCount">{{ session_pages }}</strong> page(s)</span>
+        <button id="deleteLastBtn" title="Remove the last captured page from this session (X)">
+            Delete last page (X)
+        </button>
         <button id="quitBtn" class="danger" title="Save current pages (with confirm) and quit the app">
             Quit (Q)
         </button>
@@ -101,6 +104,24 @@
                 refreshPage();
             } catch (e) {
                 show('Finish failed: ' + e.message, false);
+            } finally {
+                btn.disabled = false;
+            }
+        };
+
+        document.getElementById('deleteLastBtn').onclick = async () => {
+            const btn = document.getElementById('deleteLastBtn');
+            btn.disabled = true;
+            try {
+                const r = await post('/delete-last-page');
+                if (r.ok) {
+                    show('Last page deleted - ' + r.session_pages + ' page(s) left');
+                } else {
+                    show('No pages to delete', false);
+                }
+                refreshPage();
+            } catch (e) {
+                show('Delete failed: ' + e.message, false);
             } finally {
                 btn.disabled = false;
             }

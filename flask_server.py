@@ -194,4 +194,13 @@ class FlaskServer:
             self.session.request_quit()
             return {"ok": True}
 
+        @app.route("/delete-last-page", methods=["POST"])
+        def delete_last_page():
+            removed = self.session.delete_last_page()
+            return {
+                "ok": removed,
+                "session_pages": self.session.page_count(),
+                "last_message": self.session.last_message,
+            }
+
         return app
