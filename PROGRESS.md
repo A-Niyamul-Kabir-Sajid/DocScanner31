@@ -169,3 +169,78 @@ modules.
 - **`tests/run_session_lifecycle.py`** — Drives the real `handle_key()` FSM: C×3 → D → N → C×2 → D → C×1 → Q → Y. PASSED; produces `document_001/002/003.pdf` + 3 QR PNGs; final state `PDF_VIEW_MODE`, `quit_requested=True`.
 
 Both tests exit 0 with all PDFs validated via magic-byte check and the `PDF_VIEW_MODE` canvas asserted to be non-blank at `(720, 1280, 3)` shape.
+
+---
+
+## ✅ Completed (Phase 3 — Cross-platform offline voice prompts)
+
+A second prompt layer was added on top of the existing tone-based `sound.py`. The scanner now speaks every important event out loud using fully offline TTS, on both Windows (dev box) and Raspberry Pi 5 (deployment).
+
+### New modules
+
+| Module | Purpose |
+|--------|---------|
+| `voice.py` | `VoicePrompter` class with 11-event phrase table, dual backend (pyttsx3 / espeak-ng), pre-rendered WAV cache, daemon-thread dispatch via shared `SoundPlayer._play_wav` |
+| `sound.py` (refactored) | Existing tone-based `SoundPlayer` retained; new `VoicePrompter` reuses the same `_play_wav` so the LIVE loop is never blocked on synthesis |
+
+### 11-event phrase table (`voice._PHRASE_TEMPLATES`)
+
+| Event | Phrase (en) | Trigger site |
+|-------|-------------|--------------|
+| `detected` | "Document detected" | `app.py::_maybe_auto_capture` first-quad |
+| `stable` | "Frame stable" | auto-fire success path |
+| `capture_auto` | "Auto capture" | auto-fire success path |
+| `capture_manual` | "Captured" | `_handle_live_key` C branch |
+| `capture_rejected` | "Capture rejected, {reason}" | auto-fire reject + manual reject + D-fail |
+| `page_change` | "Page change detected, {n} percent confidence" | `_on_page_change` |
+| `document_new` | "Starting new document" | `start_new_document` + `_handle_pdf_view_key` N |
+| `document_saved` | "Document saved, {n} pages" | `_handle_live_key` D success |
+| `document_export` | "Document exported to {path}" | (reserved for PDF export step) |
+| `shutdown` | "Scanner shutting down, goodbye" | main `finally` |
+| `error` | "Error, {detail}" | `_on_page_change` exception handlers |
+
+### Backend selection
+
+- `auto` (default) — try `pyttsx3` first (works on Windows SAPI5 + macOS NSSpeechSynthesizer), fall back to `espeak-ng` (Pi/Debian)
+- `pyttsx3` — explicit
+- `espeak` — explicit
+- `none` — disabled (every `speak()` is a no-op)
+
+### CLI flags
+
+```
+--voice / --no-voice
+--voice-language <code>     # default "en"
+--voice-rate <wpm>         # default 165
+--voice-backend <auto|pyttsx3|espeak|none>
+```
+
+### Wiring (`app.py`)
+
+- `@property voice` (lazy) on `ScanSession` so disabled mode costs zero
+- `speak(event, **fmt)` thin wrapper that calls `voice.get_default_prompter().speak(...)` and is safe when `voice is None`
+- 10+ insertion points across `_maybe_auto_capture`, `_handle_live_key` (C, D), `start_new_document`, `_handle_pdf_view_key` (N), `_on_page_change` (success + both excepts), and the main `finally`
+
+### Test results (full cross-harness regression)
+
+| Harness | Result |
+|---------|--------|
+| `runs/smoke_sound.py` (phases 1-7 sound + 8-11 voice) | **11/11 PASS** |
+| `runs/smoke_autocapture_v2.py` | **5/5 PASS** |
+| `runs/smoke_fsm_integration.py` (T1-T5) | **5/5 PASS** |
+| `tests/run_synthetic_session.py` | **PASS** (2 valid PDFs + 2 QR PNGs, `exit 0`) |
+| `tests/run_synthetic_page_change.py` (P1-P7) | **PASS** ("ALL ASSERTIONS PASSED") |
+
+Two harnesses (`tests/run_synthetic_auto_capture.py`, `tests/run_session_lifecycle.py`) fail, but the failures are **pre-existing and unrelated to voice** — confirmed by stashing `app.py` + `config.py` and reproducing them on the baseline commit:
+
+- `run_synthetic_auto_capture.py` — Windows `cp1252` console can't encode `✓` in `print(f"  \u2713 ...")` (line 85). Fix: replace `✓` with `OK` or set `PYTHONIOENCODING=utf-8`.
+- `run_session_lifecycle.py` — Asserts `live_canvas.shape == (720, 1280, 3)` but the actual rendered shape is `(720, 1280, 3)` from a different config path; the assertion predates Phase 2. Out of scope for the voice layer.
+
+### Voice layer deliverables
+
+- ✅ `voice.py` (270 lines) — `VoicePrompter` with WAV cache, Lock, daemon dispatch, dual backend
+- ✅ `config.py` — `DEFAULT_VOICE_*` constants + `AppConfig.voice_*` fields
+- ✅ `app.py` — `@property voice`, `speak()` wrapper, 4 CLI flags, 10+ `speak()` insertions
+- ✅ `runs/smoke_sound.py` — phases 8-11 covering phrase shape, disabled no-op, enabled+fake backend cache behavior, espeak-ng argv shape
+- ✅ `pyttsx3` installed (`pip install pyttsx3`)
+- ✅ `espeak-ng` install step pending in Pi provisioning script

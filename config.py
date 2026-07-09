@@ -98,6 +98,19 @@ CORNER_CONFIDENCE_MIN: float = 0.30
 # re-arming so the user has time to swap pages.
 DEFAULT_AUTO_CAPTURE_ENABLED: bool = True
 DEFAULT_AUTO_CAPTURE_COOLDOWN: float = 5.0  # 5 s window so the user has time to swap the page
+
+# --------------------------------------------------------------------------- #
+# Audio cues - short WAV beeps for "doc detected / stable / captured".
+# The ``sound`` module is pure-stdlib and self-synthesises the tones, so
+# no extra pip dependency is required.  On Windows ``winsound`` is used
+# directly; on macOS / Linux the platform's built-in audio player
+# (``afplay`` / ``aplay`` / ``paplay``) is invoked through ``subprocess``.
+# If no backend is available the calls silently no-op so the LIVE loop
+# is never blocked or crashed by a missing sound card.
+# --------------------------------------------------------------------------- #
+DEFAULT_SOUND_ENABLED: bool = True
+DEFAULT_SOUND_VOLUME: float = 0.6  # 0.0 (silent) - 1.0 (full)
+DEFAULT_SOUND_SAMPLE_RATE: int = 22050
 # ~2 s of stable corners at the 30 ms LIVE tick (33 fps * 2 s ~= 66 frames).
 # 45 frames keeps the UX snappy while still rejecting hand-held shake.
 DEFAULT_STABLE_FRAMES: int = 5   # user requested a 5-frame re-confirm window per cycle
@@ -107,6 +120,18 @@ DEFAULT_STABLE_FRAMES: int = 5   # user requested a 5-frame re-confirm window pe
 # 18 px is comfortably above that noise floor but still below the drift
 # you get from a slow hand swap (~40+ px).
 DEFAULT_STABILITY_TOLERANCE: float = 18.0
+
+# --------------------------------------------------------------------------- #
+# Voice prompts (spoken cues layered on top of the tone ``sound`` module).
+# The ``voice`` module renders WAV blobs via ``pyttsx3`` on Windows or
+# ``espeak-ng`` (subprocess) on Linux / Raspberry Pi, then forwards them
+# to ``sound.SoundPlayer._play_wav`` so tones and voice share the same
+# audio backend.  Both backends are fully offline - no internet needed.
+# --------------------------------------------------------------------------- #
+DEFAULT_VOICE_ENABLED: bool = True
+DEFAULT_VOICE_LANGUAGE: str = "en"      # espeak-ng voice id; "en", "en-us", "de", ...
+DEFAULT_VOICE_RATE_WPM: int = 165       # speaking rate (pyttsx3 honours it; espeak gets ~170 wpm equivalent)
+DEFAULT_VOICE_BACKEND: str = "auto"     # "pyttsx3" | "espeak" | "auto"
 
 # --------------------------------------------------------------------------- #
 # Auto page-change detection
@@ -157,6 +182,13 @@ DEFAULT_STABLE_FRAMES = DEFAULT_STABLE_FRAMES
 DEFAULT_STABILITY_TOLERANCE = DEFAULT_STABILITY_TOLERANCE
 DEFAULT_AUTO_CAPTURE_ENABLED = DEFAULT_AUTO_CAPTURE_ENABLED
 DEFAULT_AUTO_CAPTURE_COOLDOWN = DEFAULT_AUTO_CAPTURE_COOLDOWN
+DEFAULT_SOUND_ENABLED = DEFAULT_SOUND_ENABLED
+DEFAULT_SOUND_VOLUME = DEFAULT_SOUND_VOLUME
+DEFAULT_SOUND_SAMPLE_RATE = DEFAULT_SOUND_SAMPLE_RATE
+DEFAULT_VOICE_ENABLED = DEFAULT_VOICE_ENABLED
+DEFAULT_VOICE_LANGUAGE = DEFAULT_VOICE_LANGUAGE
+DEFAULT_VOICE_RATE_WPM = DEFAULT_VOICE_RATE_WPM
+DEFAULT_VOICE_BACKEND = DEFAULT_VOICE_BACKEND
 PDF_DEFAULT_NAME = "scan.pdf"
 PDF_PREFIX = "scan_"
 
@@ -191,6 +223,10 @@ class AppConfig:
     page_change_motion_rest_px: float = PAGE_CHANGE_MOTION_REST_PX
     page_change_rest_frames: int = PAGE_CHANGE_REST_FRAMES
     page_change_quad_jump_px: float = PAGE_CHANGE_QUAD_JUMP_PX
+    voice_enabled: bool = DEFAULT_VOICE_ENABLED
+    voice_language: str = DEFAULT_VOICE_LANGUAGE
+    voice_rate_wpm: int = DEFAULT_VOICE_RATE_WPM
+    voice_backend: str = DEFAULT_VOICE_BACKEND
     extra: dict = field(default_factory=dict)
 
 

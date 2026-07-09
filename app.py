@@ -72,6 +72,25 @@ from config import (
 from auto_capture_controller import AutoCaptureController
 from document_processor import DetectionResult, DocumentProcessor
 from flask_server import FlaskServer
+from sound import SoundPlayer
+try:
+    from config import DEFAULT_SOUND_ENABLED, DEFAULT_SOUND_VOLUME
+except ImportError:  # pragma: no cover - config is required at runtime
+    DEFAULT_SOUND_ENABLED = True
+    DEFAULT_SOUND_VOLUME = 0.6
+from voice import VoicePrompter
+try:
+    from config import (
+        DEFAULT_VOICE_BACKEND,
+        DEFAULT_VOICE_ENABLED,
+        DEFAULT_VOICE_LANGUAGE,
+        DEFAULT_VOICE_RATE_WPM,
+    )
+except ImportError:  # pragma: no cover - config is required at runtime
+    DEFAULT_VOICE_ENABLED = True
+    DEFAULT_VOICE_LANGUAGE = "en"
+    DEFAULT_VOICE_RATE_WPM = 165
+    DEFAULT_VOICE_BACKEND = "auto"
 from image_grid import stack_images
 from page_change_detector import PageChangeDetector, PageChangeEvent
 from pdf_builder import PDFBuilder, document_filename
@@ -250,6 +269,26 @@ class ScanSession:
     auto_capture_cooldown_s: float = DEFAULT_AUTO_CAPTURE_COOLDOWN
     auto_capture_stable_frames: int = DEFAULT_STABLE_FRAMES
     auto_capture_tolerance_px: float = DEFAULT_STABILITY_TOLERANCE
+
+    # Audio cues.  ``sound_enabled`` is the master switch (mirrored on
+    # ``--sound`` / ``--no-sound``).  ``sound_volume`` is a 0..1 gain
+    # applied to every WAV blob at construction time.  ``_sound`` is
+    # constructed lazily so tests can monkey-patch it via
+    # ``session._sound = stub``.
+    sound_enabled: bool = DEFAULT_SOUND_ENABLED
+    sound_volume: float = DEFAULT_SOUND_VOLUME
+    _sound: Optional[SoundPlayer] = field(default=None, init=False)
+    _sound_detect_start_played: bool = field(default=False, init=False)
+
+    # Voice prompts (spoken cues layered on top of the tones).  Same
+    # lazy / monkey-patchable contract as ``_sound`` above: tests can
+    # drop in a stub via ``session._voice = ...`` and reconfigure via
+    # ``session.voice_enabled = False``.
+    voice_enabled: bool = DEFAULT_VOICE_ENABLED
+    voice_language: str = DEFAULT_VOICE_LANGUAGE
+    voice_rate_wpm: int = DEFAULT_VOICE_RATE_WPM
+    voice_backend: str = DEFAULT_VOICE_BACKEND
+    _voice: Optional[VoicePrompter] = field(default=None, init=False)
     # Internal book-keeping for the HUD pill.
     _auto_capture: Optional[AutoCaptureController] = field(default=None, init=False)
     _auto_capture_phase: str = field(default="off", init=False)
@@ -344,6 +383,65 @@ class ScanSession:
             self._auto_capture.tracker.required_frames = self.auto_capture_stable_frames
             self._auto_capture.tracker.tolerance = self.auto_capture_tolerance_px
         return self._auto_capture
+
+    @property
+    def sound(self) -> SoundPlayer:
+        """Lazy accessor for the audio cue player.
+
+        Constructed on first access so tests can replace ``_sound``
+        without triggering ``__post_init__``.
+        """
+        if self._sound is None:
+            self._sound = SoundPlayer(
+                enabled=self.sound_enabled,
+                volume=self.sound_volume,
+            )
+        return self._sound
+
+    def play_sound(self, event: str) -> None:
+        """Safe wrapper around :meth:`SoundPlayer.play_event`.
+
+        Never raises.  All exceptions are logged at DEBUG level so a
+        failing sound backend can never break the LIVE loop or the
+        quality gate.
+        """
+        if not self.sound_enabled:
+            return
+        try:
+            self.sound.play_event(event)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("play_sound(%r) failed: %s", event, exc)
+
+    @property
+    def voice(self) -> VoicePrompter:
+        """Lazy accessor for the spoken-voice prompter.
+
+        Constructed on first access so tests can replace ``_voice``
+        without triggering ``__post_init__`` (mirrors :attr:`sound`).
+        """
+        if self._voice is None:
+            self._voice = VoicePrompter(
+                enabled=self.voice_enabled,
+                language=self.voice_language,
+                rate_wpm=self.voice_rate_wpm,
+                backend=self.voice_backend,
+                sound_player=self.sound,
+            )
+        return self._voice
+
+    def speak(self, event: str, **fmt) -> None:
+        """Safe wrapper around :meth:`VoicePrompter.speak`.
+
+        Never raises.  All exceptions are logged at DEBUG level so a
+        missing TTS backend or a failing subprocess can never break the
+        LIVE loop, the quality gate, or any capture path.
+        """
+        if not self.voice_enabled:
+            return
+        try:
+            self.voice.speak(event, **fmt)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("speak(%r) failed: %s", event, exc)
 
     # ------------------------------------------------------------------ #
     # Public FSM API
@@ -562,8 +660,10 @@ class ScanSession:
                 "page-change auto-bump  conf=%.2f hash=%d quad=%.1fpx",
                 event.confidence, event.hash_distance, event.quad_distance,
             )
+            self.speak("page_change", n=int(round(event.confidence * 100)))
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("auto-bump cleanup failed: %s", exc)
+            self.speak("error", detail=str(exc))
 
         # Now grab the new page so the user sees it land in the PDF list.
         try:
@@ -573,6 +673,7 @@ class ScanSession:
             return ok
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("recursive capture during auto-bump failed: %s", exc)
+            self.speak("error", detail=str(exc))
             return None
 
     # ------------------------------------------------------------------ #
@@ -646,7 +747,16 @@ class ScanSession:
             self._auto_capture_phase = "idle"
             self._auto_capture_progress = (0, controller.tracker.required_frames)
             self.last_message = "AUTO | waiting for document"
+            # Doc just left the frame - re-arm the "first quad" cue so
+            # the next time we see one we beep again.
+            self._sound_detect_start_played = False
             return
+
+        # First frame with a real quad in this session -> cue "detected".
+        if not self._sound_detect_start_played:
+            self._sound_detect_start_played = True
+            self.play_sound("detect_start")
+            self.speak("detected")
 
         # AutoCaptureController.should_capture() returns True ONLY when:
         #   1) the quad has been stable for required_frames, AND
@@ -687,12 +797,20 @@ class ScanSession:
                     "auto-captured page %d (cooldown %.1fs)",
                     self.page_count(), self.auto_capture_cooldown_s,
                 )
+                # Audio cues - chime once to confirm stability, then the
+                # capture click.  ``detect_stable`` plays first so the
+                # user gets two distinct audible events ("ready... click").
+                self.play_sound("detect_stable")
+                self.play_sound("capture")
+                self.speak("stable")
+                self.speak("capture_auto")
             else:
                 # Capture was rejected by quality gate - re-arm quickly
                 # but stay in identifying mode so we don't spam messages.
                 self._auto_capture_phase = "identifying"
                 self._auto_capture_progress = (count, required)
                 self.last_message = f"AUTO | {msg_cap}"
+                self.speak("capture_rejected", reason=msg_cap)
             return
 
         # Not yet stable - just show progress.
@@ -747,6 +865,8 @@ class ScanSession:
         # Reset for the next document.
         self.pages = []
         self.state = ScannerState.PDF_VIEW_MODE
+        # Re-arm the "doc detected" cue so the next page gets its own blip.
+        self._sound_detect_start_played = False
         try:
             self.page_change_detector.reset()
         except Exception:  # pragma: no cover - defensive
@@ -767,6 +887,9 @@ class ScanSession:
         self.last_pdf_path = None
         self.last_qr_path = None
         self.last_message = f"new document {self.doc_counter}"
+        self.speak("document_new")
+        # Re-arm the "doc detected" cue so the next page gets its own blip.
+        self._sound_detect_start_played = False
         # Wipe the in-session captures folder so page_NNN.jpg restarts at 1.
         for f in self.scanned_dir.glob(f"{PAGE_PREFIX}*.jpg"):
             try:
@@ -846,6 +969,11 @@ class ScanSession:
                     controller.tracker.required_frames,
                     controller.tracker.required_frames,
                 )
+                # Audio cue - same "ka-chunk" as an auto-capture fire.
+                self.play_sound("capture")
+                self.speak("capture_manual")
+            else:
+                self.speak("capture_rejected", reason=msg)
             return
         if ch == "d":
             if self.page_count() == 0:
@@ -854,6 +982,9 @@ class ScanSession:
             saved = self.finish_pdf()
             if saved is not None:
                 self.last_message = f"finished -> {saved.name}"
+                self.speak("document_saved", n=self.page_count())
+            else:
+                self.speak("capture_rejected", reason=msg)
             return
         if ch == "n":
             # N is only valid in PDF_VIEW.  Stay in LIVE and tell the user.
@@ -877,6 +1008,7 @@ class ScanSession:
     def _handle_pdf_view_key(self, ch: str) -> None:
         if ch == "n":
             self.start_new_document()
+            self.speak("document_new")
             return
         if ch == "q":
             self.show_exit_modal = True
@@ -1169,6 +1301,12 @@ class ScanSession:
             except Exception:  # pragma: no cover - defensive
                 pass
         cv2.destroyAllWindows()
+        # Release any temp WAVs written for winsound playback.
+        try:
+            if self._sound is not None:
+                self._sound.close()
+        except Exception:  # pragma: no cover - defensive
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -1243,6 +1381,26 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     p.add_argument("--auto-capture-tolerance", type=float, default=None,
                    help=("Maximum pixel drift between consecutive quads "
                          "before the stability counter resets (default: 18)."))
+    p.add_argument("--sound", dest="sound", action="store_true",
+                   default=None,
+                   help="Enable audio cues (default: enabled).")
+    p.add_argument("--no-sound", dest="sound", action="store_false",
+                   default=None,
+                   help="Disable all audio cues (--sound / --no-sound).")
+    p.add_argument("--sound-volume", type=float, default=None,
+                   help=("Linear gain 0.0 (silent) - 1.0 (full) for the audio "
+                         "cues (default: 0.6)."))
+    p.add_argument("--voice", dest="voice", action="store_true",
+                   default=None,
+                   help="Enable spoken-voice prompts (default: enabled).")
+    p.add_argument("--no-voice", dest="voice", action="store_false",
+                   default=None,
+                   help="Disable spoken-voice prompts (--voice / --no-voice).")
+    p.add_argument("--voice-language", type=str, default=None,
+                   help=("espeak-ng voice id (default: en).  Examples: en, "
+                         "en-us, de, fr.  Ignored on Windows by most SAPI5 voices."))
+    p.add_argument("--voice-rate", type=int, default=None,
+                   help=("Speaking rate in words per minute (default: 165)."))
     return p.parse_args(argv)
 
 
@@ -1311,6 +1469,34 @@ def main(argv: Optional[List[str]] = None) -> int:
         session.auto_capture_tolerance_px,
     )
 
+    # Sound CLI overrides ---------------------------------------------------------
+    if getattr(args, "sound", None) is True:
+        session.sound_enabled = True
+    elif getattr(args, "sound", None) is False:
+        session.sound_enabled = False
+    if getattr(args, "sound_volume", None) is not None:
+        session.sound_volume = float(args.sound_volume)
+        # Force re-build of WAV cache at the new volume.
+        session._sound = None
+    logger.info(
+        "Sound: enabled=%s volume=%.2f",
+        session.sound_enabled, session.sound_volume,
+    )
+
+    # Voice CLI overrides --------------------------------------------------------
+    if getattr(args, "voice", None) is True:
+        session.voice_enabled = True
+    elif getattr(args, "voice", None) is False:
+        session.voice_enabled = False
+    if getattr(args, "voice_language", None) is not None:
+        session.voice_language = str(args.voice_language)
+    if getattr(args, "voice_rate", None) is not None:
+        session.voice_rate_wpm = int(args.voice_rate)
+    logger.info(
+        "Voice: enabled=%s language=%s rate=%d wpm",
+        session.voice_enabled, session.voice_language, session.voice_rate_wpm,
+    )
+
     logger.info(
         "Starting scanner: source=%r backend=%s %dx%d web=%s host=%s port=%d",
         args.source, args.backend, args.width, args.height,
@@ -1327,6 +1513,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger.info("Interrupted by user - shutting down.")
     finally:
         session.shutdown()
+        session.speak("shutdown")
     return 0
 
 
