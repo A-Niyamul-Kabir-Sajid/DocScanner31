@@ -49,6 +49,7 @@ import numpy as np
 from camera import Camera
 from config import (
     ABSOLUTE_BLUR_MIN_VARIANCE,
+    CAMERA_RETRY_SECONDS,
     DEFAULT_AUTO_CAPTURE_COOLDOWN,
     DEFAULT_AUTO_CAPTURE_ENABLED,
     DEFAULT_CAMERA_HEIGHT,
@@ -237,6 +238,12 @@ class ScanSession:
 
     # Collaborators (created on demand so tests can replace them).
     _camera: Optional[Camera] = field(default=None, init=False)
+    # ``time.monotonic()`` deadline for the next camera-reopen attempt.
+    # 0.0 means "no retry scheduled" (camera is online, or we haven't yet
+    # observed the first failure). The LIVE loop ticks this forward by
+    # ``CAMERA_RETRY_SECONDS`` while the camera is offline so the device
+    # is probed at a steady cadence rather than every frame.
+    _next_camera_retry_at: float = field(default=0.0, init=False)
     _processor: Optional[DocumentProcessor] = field(default=None, init=False)
     _quality_gate: Optional[QualityGate] = field(default=None, init=False)
     _pdf_builder: Optional[PDFBuilder] = field(default=None, init=False)
@@ -310,14 +317,86 @@ class ScanSession:
     # ------------------------------------------------------------------ #
     @property
     def camera(self) -> Camera:
+        """Lazy, crash-safe accessor for the underlying ``Camera``.
+
+        The first call attempts to open the configured source.  If the
+        device is missing we keep the partially-initialised handle (with
+        ``is_open=False``) so the rest of the app can render a "camera not
+        found" overlay and poll ``try_reopen()`` from the LIVE loop.
+        """
         if self._camera is None:
-            self._camera = Camera(
-                source=self.camera_source,
-                width=self.camera_width,
-                height=self.camera_height,
-                backend=self.camera_backend,
-            )
+            try:
+                self._camera = Camera(
+                    source=self.camera_source,
+                    width=self.camera_width,
+                    height=self.camera_height,
+                    backend=self.camera_backend,
+                )
+            except Exception as exc:  # pragma: no cover - defensive belt
+                # Camera.__init__ no longer raises, but guard the legacy
+                # picamera2 path that still does on missing libs.
+                logger.warning("Camera init failed: %s", exc)
+                self._camera = Camera.__new__(Camera)
+                self._camera.source = self.camera_source
+                self._camera.width = self.camera_width
+                self._camera.height = self.camera_height
+                self._camera.backend = self.camera_backend
+                self._camera._cap = None
+                self._camera._pi_cam = None
+                self._camera.is_open = False
+                self._camera.last_open_error = str(exc)
         return self._camera
+
+    # ------------------------------------------------------------------ #
+    # Camera health / retry helpers
+    # ------------------------------------------------------------------ #
+    def _ensure_camera_alive(self) -> None:
+        """Reconnect to the camera if it's currently offline.
+
+        Called from the LIVE tick. We only fire a real reopen every
+        ``CAMERA_RETRY_SECONDS`` so the network/source isn't hammered on
+        every frame. The countdown is driven by ``time.monotonic`` so the
+        interval stays correct across OpenCV's ``waitKey`` jitter.
+        """
+        cam = self._camera
+        if cam is None:
+            # Force the lazy property to materialise (covers picamera2).
+            _ = self.camera
+            cam = self._camera
+        if cam is None or cam.is_open:
+            self._next_camera_retry_at = 0.0
+            return
+
+        now = time.monotonic()
+        if self._next_camera_retry_at == 0.0:
+            self._next_camera_retry_at = now + CAMERA_RETRY_SECONDS
+        if now < self._next_camera_retry_at:
+            return
+
+        logger.info("Retrying camera open (source=%r)…", self.camera_source)
+        ok = cam.try_reopen()
+        if ok:
+            logger.info("Camera reconnected.")
+            self._next_camera_retry_at = 0.0
+            self.last_message = "Camera reconnected"
+        else:
+            self._next_camera_retry_at = now + CAMERA_RETRY_SECONDS
+            logger.debug("Camera still offline: %s", cam.last_open_error)
+
+    def camera_status(self) -> dict:
+        """Snapshot used by the LIVE overlay to render the offline banner."""
+        cam = self._camera
+        online = bool(cam and cam.is_open)
+        retry_in = 0.0
+        if not online and self._next_camera_retry_at > 0.0:
+            retry_in = max(0.0, self._next_camera_retry_at - time.monotonic())
+        return {
+            "online": online,
+            "source": self.camera_source,
+            "backend": self.camera_backend,
+            "error": (cam.last_open_error if cam else "camera not initialised"),
+            "retry_in": retry_in,
+        }
 
     @property
     def processor(self) -> DocumentProcessor:
@@ -1125,10 +1204,19 @@ class ScanSession:
 
     # ------------------------------------------------------------------ #
     def _render_live(self, frame: Optional[np.ndarray]) -> np.ndarray:
+        # Heartbeat the camera watchdog BEFORE we try to read so the
+        # "retry in X.Xs" countdown is always based on the freshest state.
+        self._ensure_camera_alive()
+
         if frame is None:
             ok, frame = self.camera.read()
-            if not ok or frame is None:
-                frame = np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8)
+
+        # If the camera is offline (no handle / read failed / no quad
+        # possible on an all-black frame), short-circuit to a dedicated
+        # "camera not found" canvas so the app never crashes mid-session.
+        status = self.camera_status()
+        if (not status["online"]) or (frame is None) or (not ok):
+            return self._render_camera_offline(status, frame)
 
         # Run the processor so the overlay reflects current detection state.
         try:
@@ -1256,6 +1344,99 @@ class ScanSession:
         return canvas
 
     # ------------------------------------------------------------------ #
+    def _render_camera_offline(
+        self, status: dict, last_frame: Optional[np.ndarray]
+    ) -> np.ndarray:
+        """Draw the 'camera not found' banner with a live retry countdown.
+
+        ``last_frame`` is the placeholder frame the camera returned (an
+        all-black image when the device is unreachable).  We use it as
+        the canvas so the window still has the configured resolution.
+        """
+        h, w = self.camera_height, self.camera_width
+        canvas = (
+            last_frame.copy()
+            if (last_frame is not None and last_frame.shape[:2] == (h, w))
+            else np.zeros((h, w, 3), dtype=np.uint8)
+        )
+        # Soft red wash so the "offline" state is impossible to miss.
+        overlay = canvas.copy()
+        cv2.rectangle(overlay, (0, 0), (w, h), (32, 16, 16), thickness=-1)
+        cv2.addWeighted(overlay, 0.35, canvas, 0.65, 0, canvas)
+
+        # Header
+        _draw_text(
+            canvas,
+            "CAMERA NOT FOUND",
+            (20, 50),
+            color=(255, 255, 255),
+            bg=(40, 0, 0),
+            scale=1.1,
+            thickness=2,
+        )
+
+        # Source / backend
+        src = status.get("source", "?")
+        backend = status.get("backend", "?")
+        _draw_text(
+            canvas,
+            f"source: {src}",
+            (20, 90),
+            color=(255, 220, 220),
+            bg=(40, 0, 0),
+        )
+        _draw_text(
+            canvas,
+            f"backend: {backend}",
+            (20, 120),
+            color=(255, 220, 220),
+            bg=(40, 0, 0),
+        )
+
+        # Reason
+        err = status.get("error") or "no signal"
+        _draw_text(
+            canvas,
+            f"reason: {err}",
+            (20, 150),
+            color=(255, 200, 200),
+            bg=(40, 0, 0),
+        )
+
+        # Retry countdown (driven by ``time.monotonic``).
+        retry_in = float(status.get("retry_in") or 0.0)
+        _draw_text(
+            canvas,
+            f"retrying in {retry_in:0.1f}s ...",
+            (20, 190),
+            color=(255, 255, 0),
+            bg=(40, 0, 0),
+        )
+
+        # Help text
+        _draw_text(
+            canvas,
+            "Tip: start DroidCam / IP Webcam, then verify the URL.",
+            (20, 230),
+            color=(220, 220, 220),
+            bg=(40, 0, 0),
+        )
+
+        # Footer (keep the normal hotkey hints visible)
+        _draw_text(
+            canvas,
+            "[Q] quit   (app keeps polling every "
+            f"{CAMERA_RETRY_SECONDS:.0f}s until the camera is back)",
+            (10, h - 20),
+            color=(180, 180, 180),
+            bg=(0, 0, 0),
+        )
+
+        if self.show_exit_modal:
+            self._draw_exit_modal(canvas)
+        return canvas
+
+    # ------------------------------------------------------------------ #
     def _render_live_fallback(self, frame: np.ndarray) -> np.ndarray:
         """Single-tile fallback when ``process_with_debug`` or stacking fails."""
         try:
@@ -1367,6 +1548,12 @@ class ScanSession:
         cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
         try:
             while not self.quit_requested:
+                # Camera heartbeat FIRST: keeps the "retry in X.Xs"
+                # countdown honest and prevents auto-capture / render
+                # from calling ``camera.read()`` before we've had a
+                # chance to recover the handle.
+                self._ensure_camera_alive()
+
                 # Tick the auto-capture state machine BEFORE rendering so
                 # the HUD pill shows the result of this frame's check.
                 if (

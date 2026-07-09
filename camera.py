@@ -20,12 +20,39 @@ stays identical.
 from __future__ import annotations
 
 import logging
+import socket
 from typing import Optional, Tuple
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------- #
+# Fast TCP probe for HTTP camera URLs
+# --------------------------------------------------------------------------- #
+def _probe_http_url(url: str, timeout: float = 1.0) -> bool:
+    """Return True if the host:port in *url* is reachable right now.
+
+    This is a **cheap, non-blocking** check that avoids the 10-30 s
+    connect timeout baked into ``cv2.VideoCapture``'s FFMPEG backend.
+    We only verify that the TCP socket accepts a connection; we do NOT
+    send an HTTP request or read any data.
+    """
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except Exception:  # pragma: no cover - malformed URL
+        return True  # let OpenCV try and report its own error
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, socket.timeout):
+        return False
 
 
 class Camera:
@@ -55,17 +82,29 @@ class Camera:
         self.backend = backend
         self._cap: Optional[cv2.VideoCapture] = None
         self._pi_cam = None  # only set when backend == "picamera2"
+        # Track the last open attempt so the app layer can poll for recovery.
+        # ``is_open`` is the canonical "is the camera usable right now?" flag.
+        self.is_open: bool = False
+        self.last_open_error: Optional[str] = None
 
         if backend == "picamera2":
             self._open_picamera2()
         else:
-            self._open_opencv()
+            # OpenCV: do NOT raise on failure - the caller (ScanSession)
+            # shows a "camera not found" overlay and retries every few
+            # seconds. Raising here would terminate the app.
+            self._open_opencv(raise_on_failure=False)
 
     # ------------------------------------------------------------------ #
     # Backend openers
     # ------------------------------------------------------------------ #
-    def _open_opencv(self) -> None:
-        """Open a UVC / network stream via OpenCV."""
+    def _open_opencv(self, raise_on_failure: bool = True) -> None:
+        """Open a UVC / network stream via OpenCV.
+
+        When ``raise_on_failure`` is False the method logs and stores
+        the error in ``self.last_open_error`` instead of raising, so the
+        app layer can keep running and try again later.
+        """
         # Accept either a numeric index (e.g. "0", "1") or a URL.
         # Numeric strings are converted to int so cv2.VideoCapture uses the
         # DirectShow/MSMF index path on Windows; URLs stay as strings for the
@@ -79,23 +118,91 @@ class Camera:
             url = str(src)
         logger.info("Opening OpenCV camera source=%r", src)
 
-        if url is not None:
-            # Network streams (DroidCam / IP Webcam) ship as
-            # ``multipart/x-mixed-replace`` MJPEG.  On Windows, the default
-            # backend often refuses to open the URL; explicitly routing
-            # through FFMPEG fixes this on the opencv-python 4.13 wheel.
-            self._cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
-        else:
-            self._cap = cv2.VideoCapture(src)
+        # If we previously held a handle, drop it before opening a new one.
+        if self._cap is not None:
+            try:
+                self._cap.release()
+            except Exception:  # pragma: no cover - best-effort cleanup
+                pass
+            self._cap = None
 
-        if not self._cap.isOpened():
-            raise RuntimeError(
+        # Fast TCP probe for HTTP(S) URLs. ``cv2.VideoCapture`` will happily
+        # block for tens of seconds waiting for a DroidCam / IP Webcam
+        # server that doesn't exist, which makes the app look frozen.
+        # A 1-second connect timeout is plenty for a phone on the same
+        # LAN; if the device is genuinely offline we want to learn that
+        # *fast* so we can show the "camera not found" overlay and retry.
+        if url is not None:
+            if not _probe_http_url(url, timeout=1.0):
+                self.last_open_error = (
+                    f"Could not reach camera URL {url!r} "
+                    "(connection refused / timeout / DNS failure)."
+                )
+                logger.warning(self.last_open_error)
+                self.is_open = False
+                if raise_on_failure:
+                    raise RuntimeError(self.last_open_error)
+                return
+
+        try:
+            if url is not None:
+                # Network streams (DroidCam / IP Webcam) ship as
+                # ``multipart/x-mixed-replace`` MJPEG.  On Windows, the default
+                # backend often refuses to open the URL; explicitly routing
+                # through FFMPEG fixes this on the opencv-python 4.13 wheel.
+                self._cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+            else:
+                self._cap = cv2.VideoCapture(src)
+        except Exception as exc:  # pragma: no cover - cv2 rarely throws
+            self.is_open = False
+            self.last_open_error = f"{type(exc).__name__}: {exc}"
+            logger.warning("Camera open raised: %s", self.last_open_error)
+            if raise_on_failure:
+                raise
+            return
+
+        opened = bool(self._cap.isOpened())
+        if not opened:
+            self.last_open_error = (
                 f"Could not open camera source {self.source!r}. "
                 "Check the index/URL and that DroidCam / IP Webcam is running."
             )
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            logger.warning(self.last_open_error)
+            self.is_open = False
+            if raise_on_failure:
+                raise RuntimeError(self.last_open_error)
+            return
 
+        # Success: apply requested geometry.
+        try:
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        except Exception:  # pragma: no cover - some cams refuse set()
+            pass
+        self.is_open = True
+        self.last_open_error = None
+
+    # ------------------------------------------------------------------ #
+    # Recovery
+    # ------------------------------------------------------------------ #
+    def try_reopen(self) -> bool:
+        """Attempt to (re)open the underlying capture device.
+
+        Returns True if the camera is now usable, False otherwise.  Safe to
+        call on every frame; the actual ``cv2.VideoCapture`` call is cheap
+        when the source is reachable.
+        """
+        if self.backend == "picamera2":
+            # picamera2 currently raises on failure; we don't auto-recover
+            # it here. The Pi boot path is rarely the failure case the user
+            # is hitting (their crash is on Windows + DroidCam URL).
+            return self._pi_cam is not None
+        self._open_opencv(raise_on_failure=False)
+        return self.is_open
+
+    # ------------------------------------------------------------------ #
+    # Backend openers
+    # ------------------------------------------------------------------ #
     def _open_picamera2(self) -> None:
         """Open the Raspberry Pi Camera Module via picamera2."""
         try:
@@ -122,16 +229,35 @@ class Camera:
 
         For picamera2 the captured array is already RGB, so we convert to
         BGR to keep the rest of the OpenCV pipeline unchanged.
+
+        When the camera is offline (``is_open`` is False or the underlying
+        handle was never created) we return ``(False, empty_frame)`` instead
+        of raising so the GUI loop can render its "camera not found" overlay
+        without crashing.
         """
         if self.backend == "picamera2":
-            assert self._pi_cam is not None
+            if self._pi_cam is None:
+                empty = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+                return False, empty
             frame_rgb = self._pi_cam.capture_array()
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
             return True, frame_bgr
 
-        assert self._cap is not None
-        ok, frame = self._cap.read()
+        if not self.is_open or self._cap is None:
+            empty = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+            return False, empty
+
+        try:
+            ok, frame = self._cap.read()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Camera read raised: %s", exc)
+            self.is_open = False
+            empty = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+            return False, empty
         if not ok:
+            # Network streams sometimes return a frame of zeros on a
+            # transient hiccup. Mark the camera unhealthy so the app can
+            # schedule a retry without crashing the rest of the pipeline.
             logger.warning("Camera frame read failed")
         return ok, frame
 

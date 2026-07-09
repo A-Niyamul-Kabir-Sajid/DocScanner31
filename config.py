@@ -33,6 +33,11 @@ TEMPLATES_DIR: Path = PROJECT_ROOT / "templates"
 DEFAULT_CAMERA_WIDTH: int = 1280
 DEFAULT_CAMERA_HEIGHT: int = 720
 DEFAULT_BACKEND: str = "opencv"           # "opencv" | "picamera2"
+# When the configured camera source is unreachable, the LIVE loop shows a
+# "camera not found" overlay and re-attempts ``Camera.try_reopen()`` every
+# CAMERA_RETRY_SECONDS seconds (the heartbeat tick comes from the same 30 ms
+# render loop). The app stays alive indefinitely until the device comes back.
+CAMERA_RETRY_SECONDS: float = 3.0
 
 # --------------------------------------------------------------------------- #
 # Document scanning pipeline
