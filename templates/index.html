@@ -4,158 +4,576 @@
     <meta charset="utf-8">
     <title>Smart Document Scanner</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
     <style>
-        :root { color-scheme: light dark; }
-        body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 1100px; }
-        h1   { margin-top: 0; }
-        .toolbar { display: flex; gap: .75rem; flex-wrap: wrap; margin: 1rem 0; }
-        button { padding: .55rem 1rem; font-size: 1rem; cursor: pointer; }
-        .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 1rem; }
-        .gallery figure { margin: 0; border: 1px solid #ccc; padding: .5rem; border-radius: 6px; background: #fafafa; }
-        .gallery img    { width: 100%; height: auto; display: block; }
-        figcaption       { font-size: .85rem; text-align: center; margin-top: .35rem; color: #555; }
-        .status          { padding: .5rem .75rem; border-radius: 4px; background: #eee; }
-        .status.ok       { background: #d4edda; }
-        .status.err      { background: #f8d7da; }
-        .badge           { display: inline-block; padding: .35rem .65rem; border-radius: 999px; background: #e7f1ff; color: #084c93; font-size: .9rem; }
-        button.danger    { background: #c0392b; color: white; border: none; border-radius: 4px; }
-        button.danger:hover { background: #a93226; }
-        button[disabled] { opacity: .6; cursor: progress; }
+        /* ----------------------------------------------------------------
+           Tokens — tuned for an embedded / Raspberry Pi 5 display.
+           Pure CSS (no fonts, no CDN) so the page renders fully offline
+           and stays under ~6 KB after gzip.
+        ---------------------------------------------------------------- */
+        :root {
+            --bg-0:   #0b1020;
+            --bg-1:   #121935;
+            --bg-2:   #1a2347;
+            --line:   #2a3563;
+            --text:   #e6ecff;
+            --muted:  #8a93b8;
+            --brand:  #4f8cff;
+            --brand-2:#7aa9ff;
+            --ok:     #2bd49c;
+            --warn:   #ffb547;
+            --err:    #ff5d6c;
+            --chip:   #1f2a55;
+            --shadow: 0 10px 30px rgba(0,0,0,.45);
+        }
+        @media (prefers-color-scheme: light) {
+            :root {
+                --bg-0:#f4f6fb; --bg-1:#ffffff; --bg-2:#f0f3fa;
+                --line:#dde2ee; --text:#14182b; --muted:#5a6479;
+                --brand:#2f6df0; --brand-2:#1f57d4;
+                --chip:#e9eef9; --shadow:0 8px 22px rgba(20,24,43,.08);
+            }
+        }
+
+        * { box-sizing: border-box; }
+        html, body { height: 100%; }
+        body {
+            margin: 0;
+            font: 15px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+                  Roboto, "Helvetica Neue", Arial, sans-serif;
+            color: var(--text);
+            background:
+                radial-gradient(1200px 600px at 10% -10%, rgba(79,140,255,.18), transparent 60%),
+                radial-gradient(900px 500px at 110% 10%, rgba(43,212,156,.10), transparent 55%),
+                var(--bg-0);
+            -webkit-font-smoothing: antialiased;
+        }
+
+        a { color: var(--brand-2); text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        kbd {
+            font: 600 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            padding: 2px 6px; border-radius: 4px;
+            background: var(--chip); color: var(--text);
+            border: 1px solid var(--line);
+        }
+
+        /* ----------------------------------------------------------------
+           Header
+        ---------------------------------------------------------------- */
+        header.top {
+            position: sticky; top: 0; z-index: 10;
+            backdrop-filter: saturate(140%) blur(8px);
+            background: linear-gradient(180deg, rgba(11,16,32,.85), rgba(11,16,32,.55));
+            border-bottom: 1px solid var(--line);
+        }
+        @media (prefers-color-scheme: light) {
+            header.top { background: linear-gradient(180deg, rgba(255,255,255,.9), rgba(255,255,255,.6)); }
+        }
+        .top-inner {
+            max-width: 1200px; margin: 0 auto;
+            padding: 14px 22px;
+            display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+        }
+        .brand {
+            display: flex; align-items: center; gap: 10px;
+            font-weight: 700; letter-spacing: .2px;
+        }
+        .brand-mark {
+            width: 28px; height: 28px; border-radius: 8px;
+            background: linear-gradient(135deg, var(--brand), var(--ok));
+            box-shadow: 0 6px 18px rgba(79,140,255,.45);
+            display: grid; place-items: center;
+            color: #fff; font-size: 14px; font-weight: 800;
+        }
+        .brand small { color: var(--muted); font-weight: 500; margin-left: 4px; }
+        .top-spacer { flex: 1; }
+
+        /* ----------------------------------------------------------------
+           KPI tiles
+        ---------------------------------------------------------------- */
+        .kpis {
+            max-width: 1200px; margin: 18px auto 0; padding: 0 22px;
+            display: grid; gap: 14px;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+        }
+        @media (max-width: 720px) {
+            .kpis { grid-template-columns: repeat(2, 1fr); }
+        }
+        .kpi {
+            background: linear-gradient(180deg, var(--bg-1), var(--bg-2));
+            border: 1px solid var(--line);
+            border-radius: 14px;
+            padding: 14px 16px;
+            box-shadow: var(--shadow);
+        }
+        .kpi .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .8px; }
+        .kpi .value { font-size: 26px; font-weight: 700; margin-top: 4px; }
+        .kpi.ok    .value { color: var(--ok); }
+        .kpi.warn  .value { color: var(--warn); }
+
+        /* ----------------------------------------------------------------
+           Layout grid
+        ---------------------------------------------------------------- */
+        main {
+            max-width: 1200px; margin: 0 auto;
+            padding: 18px 22px 60px;
+            display: grid; gap: 22px;
+            grid-template-columns: 1fr;
+        }
+        section.card {
+            background: var(--bg-1);
+            border: 1px solid var(--line);
+            border-radius: 14px;
+            box-shadow: var(--shadow);
+            overflow: hidden;
+        }
+        section.card > header {
+            padding: 12px 16px;
+            display: flex; align-items: center; gap: 10px;
+            border-bottom: 1px solid var(--line);
+            background: linear-gradient(180deg, rgba(255,255,255,.02), transparent);
+        }
+        section.card > header h2 {
+            font-size: 14px; margin: 0; letter-spacing: .4px;
+            text-transform: uppercase; color: var(--muted); font-weight: 600;
+        }
+        section.card > header .right { margin-left: auto; }
+        section.card > .body { padding: 14px 16px 18px; }
+
+        /* ----------------------------------------------------------------
+           Controls
+        ---------------------------------------------------------------- */
+        .actions {
+            display: grid; gap: 10px;
+            grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+        }
+        button {
+            appearance: none; border: 1px solid var(--line);
+            background: var(--bg-2); color: var(--text);
+            padding: 11px 14px; border-radius: 10px;
+            font: inherit; font-weight: 600;
+            cursor: pointer;
+            transition: transform .04s ease, background .15s ease, border-color .15s ease;
+            display: inline-flex; align-items: center; gap: 8px; justify-content: center;
+        }
+        button:hover  { background: #243169; border-color: #384a8a; }
+        button:active { transform: translateY(1px); }
+        button.primary { background: linear-gradient(180deg, var(--brand), var(--brand-2)); border-color: transparent; color: #fff; }
+        button.primary:hover { filter: brightness(1.05); }
+        button.danger  { background: #c0392b; border-color: transparent; color: #fff; }
+        button.danger:hover  { background: #a93226; }
+        button.ghost   { background: transparent; }
+        button[disabled] { opacity: .55; cursor: progress; }
+        .icon { width: 16px; height: 16px; flex: none; }
+
+        .shortcuts {
+            display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
+            color: var(--muted); font-size: 13px;
+        }
+
+        /* ----------------------------------------------------------------
+           Gallery
+        ---------------------------------------------------------------- */
+        .gallery {
+            display: grid; gap: 12px;
+            grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+        }
+        .gallery figure {
+            margin: 0; position: relative; overflow: hidden;
+            border-radius: 10px; border: 1px solid var(--line);
+            background: var(--bg-2);
+        }
+        .gallery img {
+            width: 100%; height: 130px; object-fit: cover; display: block;
+            background: #000;
+        }
+        .gallery figcaption {
+            font-size: 12px; padding: 6px 8px;
+            color: var(--muted);
+            display: flex; justify-content: space-between; align-items: center;
+        }
+        .gallery .badge {
+            position: absolute; top: 6px; left: 6px;
+            background: rgba(0,0,0,.55); color: #fff;
+            font-size: 11px; padding: 2px 6px; border-radius: 999px;
+        }
+        .empty {
+            color: var(--muted);
+            padding: 22px; text-align: center; border: 1px dashed var(--line);
+            border-radius: 10px; background: rgba(255,255,255,.02);
+        }
+
+        /* ----------------------------------------------------------------
+           Saved PDFs table
+        ---------------------------------------------------------------- */
+        table.docs {
+            width: 100%; border-collapse: collapse;
+            font-size: 14px;
+        }
+        table.docs th, table.docs td {
+            text-align: left; padding: 10px 12px;
+            border-bottom: 1px solid var(--line);
+        }
+        table.docs th {
+            color: var(--muted); font-weight: 600; font-size: 12px;
+            text-transform: uppercase; letter-spacing: .6px;
+        }
+        table.docs tr:hover td { background: rgba(255,255,255,.02); }
+        table.docs td.qr img {
+            height: 38px; width: 38px; object-fit: contain;
+            border-radius: 6px; background: #fff; padding: 2px;
+        }
+        .pill {
+            display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px;
+            background: var(--chip); color: var(--text);
+        }
+        .pill.latest { background: rgba(43,212,156,.18); color: var(--ok); }
+
+        /* ----------------------------------------------------------------
+           Toast
+        ---------------------------------------------------------------- */
+        .toast-wrap {
+            position: fixed; right: 18px; bottom: 18px; z-index: 50;
+            display: flex; flex-direction: column; gap: 8px;
+            pointer-events: none;
+        }
+        .toast {
+            pointer-events: auto;
+            background: var(--bg-1); color: var(--text);
+            border: 1px solid var(--line); border-left: 3px solid var(--brand);
+            border-radius: 10px; padding: 10px 14px; min-width: 220px;
+            box-shadow: var(--shadow);
+            font-size: 14px;
+            animation: slidein .25s ease;
+        }
+        .toast.ok  { border-left-color: var(--ok); }
+        .toast.err { border-left-color: var(--err); }
+        @keyframes slidein {
+            from { transform: translateY(8px); opacity: 0; }
+            to   { transform: translateY(0);    opacity: 1; }
+        }
+
+        /* tiny utilities */
+        .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+        .grow { flex: 1; }
+        .muted { color: var(--muted); }
     </style>
 </head>
 <body>
-    <h1>Smart Document Scanner</h1>
-    <p>
-        Capture pages with <kbd>C</kbd>, press <kbd>D</kbd> to save the current
-        session as <code>scan_N.pdf</code> and start a new one, then
-        <kbd>Q</kbd> to quit (you'll be asked whether to save first).
-    </p>
 
-    <div class="toolbar">
-        <button id="finishBtn" title="Save the current session as scan_N.pdf and start a new one">
-            Finish PDF (D)
-        </button>
-        <span class="badge">Session: <strong id="sessionCount">{{ session_pages }}</strong> page(s)</span>
-        <button id="deleteLastBtn" title="Remove the last captured page from this session (X)">
-            Delete last page (X)
-        </button>
-        <button id="quitBtn" class="danger" title="Save current pages (with confirm) and quit the app">
-            Quit (Q)
-        </button>
-        <input id="qrInput" type="text" placeholder="URL to encode in QR" size="40">
-        <button id="buildQrBtn">Build QR</button>
-    </div>
-
-    <div id="status" class="status" hidden></div>
-
-    <h2>Captured pages <small>(this session)</small></h2>
-    {% if pages %}
-        <div class="gallery">
-            {% for name in pages %}
-                <figure>
-                    <img src="{{ url_for('serve_capture', filename=name) }}" alt="{{ name }}">
-                    <figcaption>{{ name }}</figcaption>
-                </figure>
-            {% endfor %}
+<header class="top">
+    <div class="top-inner">
+        <div class="brand">
+            <div class="brand-mark">DS</div>
+            <div>Smart Document Scanner <small>· control panel</small></div>
         </div>
-    {% else %}
-        <p><em>No pages captured yet.</em></p>
-    {% endif %}
+        <div class="top-spacer"></div>
+        <div class="shortcuts">
+            <span><kbd>C</kbd> capture</span>
+            <span><kbd>D</kbd> finish PDF</span>
+            <span><kbd>N</kbd> new session</span>
+            <span><kbd>X</kbd> delete last</span>
+            <span><kbd>Q</kbd> quit</span>
+        </div>
+    </div>
+</header>
 
-    <h2>Saved PDFs</h2>
-    <ul>
-        {% if saved_pdfs %}
-            {% for name in saved_pdfs %}
-                <li><a href="{{ url_for('download_output', filename=name) }}">{{ name }}</a></li>
-            {% endfor %}
-        {% endif %}
-        {% if qr_exists %}
-            <li><a href="{{ url_for('download_output', filename='qrcode.png') }}">qrcode.png</a></li>
-        {% endif %}
-        {% if not saved_pdfs and not qr_exists %}
-            <li><em>None yet.</em></li>
-        {% endif %}
-    </ul>
+<!-- KPI tiles -->
+<section class="kpis" aria-label="Status">
+    <div class="kpi">
+        <div class="label">Current session</div>
+        <div class="value"><span id="sessionCount">{{ session_pages }}</span>
+            <span class="muted" style="font-size:13px;font-weight:500">page{% if session_pages != 1 %}s{% endif %}</span>
+        </div>
+    </div>
+    <div class="kpi ok">
+        <div class="label">Saved PDFs</div>
+        <div class="value">{{ pdfs|length }}</div>
+    </div>
+    <div class="kpi">
+        <div class="label">Latest document</div>
+        <div class="value" style="font-size:18px">
+            {% if latest %}#{{ "%03d"|format(latest_num) }}{% else %}—{% endif %}
+        </div>
+    </div>
+    <div class="kpi warn">
+        <div class="label">Web UI</div>
+        <div class="value" style="font-size:16px;font-weight:600">http://{{ request.host }}</div>
+    </div>
+</section>
 
-    <script>
-        const status = document.getElementById('status');
-        const sessionCount = document.getElementById('sessionCount');
-        function show(msg, ok = true) {
-            status.hidden = false;
-            status.textContent = msg;
-            status.className = 'status ' + (ok ? 'ok' : 'err');
+<main>
+
+    <!-- Actions -->
+    <section class="card">
+        <header>
+            <h2>Actions</h2>
+            <div class="right muted" id="lastMsg">—</div>
+        </header>
+        <div class="body">
+            <div class="actions">
+                <button id="finishBtn" class="primary" title="Save the current session as document_NNN.pdf and start a new one">
+                    Finish PDF <kbd>D</kbd>
+                </button>
+                <button id="newSessBtn" title="Close PDF_VIEW dialog and start a fresh document">
+                    New session <kbd>N</kbd>
+                </button>
+                <button id="deleteLastBtn" title="Remove the last captured page from this session">
+                    Delete last page <kbd>X</kbd>
+                </button>
+                <button id="quitBtn" class="danger" title="Save current pages (with confirm) and quit the app">
+                    Quit <kbd>Q</kbd>
+                </button>
+            </div>
+            <p class="muted" style="margin: 12px 2px 0; font-size: 13px;">
+                Tip: the desktop window keeps the live camera feed; this page is the
+                companion control panel for finishing PDFs, browsing captures, and
+                downloading the QR codes that link to each PDF.
+            </p>
+        </div>
+    </section>
+
+    <!-- Captured pages gallery -->
+    <section class="card">
+        <header>
+            <h2>Captured pages <small class="muted" style="text-transform:none;letter-spacing:0">(this session)</small></h2>
+            <div class="right"><span class="pill" id="capPill">{{ captures|length }} in buffer</span></div>
+        </header>
+        <div class="body">
+            {% if captures %}
+                <div class="gallery" id="gallery">
+                    {% for name in captures %}
+                        <figure>
+                            <span class="badge">#{{ loop.index }}</span>
+                            <img src="{{ url_for('serve_capture', filename=name) }}" alt="{{ name }}" loading="lazy">
+                            <figcaption><span>{{ name }}</span></figcaption>
+                        </figure>
+                    {% endfor %}
+                </div>
+            {% else %}
+                <div class="empty" id="emptyCaptures">No pages captured yet — press <kbd>C</kbd> in the desktop window.</div>
+            {% endif %}
+        </div>
+    </section>
+
+    <!-- Saved PDFs -->
+    <section class="card">
+        <header>
+            <h2>Saved PDFs</h2>
+            <div class="right">
+                {% if latest %}
+                    <a class="pill latest" href="{{ latest_url }}">⇣ latest · {{ latest }}</a>
+                {% endif %}
+            </div>
+        </header>
+        <div class="body">
+            {% if pdfs %}
+                <table class="docs">
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>File</th>
+                            <th>QR</th>
+                            <th class="muted">Links</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    {% for num, name in pdfs %}
+                        <tr>
+                            <td><span class="pill">#{{ "%03d"|format(num) }}</span></td>
+                            <td><a href="{{ url_for('download_pdf', doc_id=num) }}">{{ name }}</a></td>
+                            <td class="qr">
+                                {% set qr_name = 'document_%03d.png'|format(num) %}
+                                {% if qr_name in qrs|map(attribute=1)|list %}
+                                    <a href="{{ url_for('download_qr', doc_id=num) }}" title="Open QR">
+                                        <img src="{{ url_for('download_qr', doc_id=num) }}" alt="QR for {{ name }}">
+                                    </a>
+                                {% else %}
+                                    <span class="muted">—</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                <a href="{{ url_for('download_pdf', doc_id=num) }}">PDF</a>
+                                {% if qr_name in qrs|map(attribute=1)|list %}
+                                    · <a href="{{ url_for('download_qr', doc_id=num) }}">QR</a>
+                                {% endif %}
+                            </td>
+                        </tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            {% else %}
+                <div class="empty">No PDFs saved yet — press <kbd>D</kbd> to finish a session.</div>
+            {% endif %}
+        </div>
+    </section>
+
+</main>
+
+<div class="toast-wrap" id="toasts" aria-live="polite"></div>
+
+<script>
+/* ----------------------------------------------------------------------
+   Vanilla JS — no frameworks, no CDN.  Tuned for low CPU on a Pi 5.
+---------------------------------------------------------------------- */
+const $  = (s, r=document) => r.querySelector(s);
+const $$ = (s, r=document) => Array.from(r.querySelectorAll(s));
+
+/* ---------- toast ---------- */
+function toast(msg, kind = "ok", ttl = 3200) {
+    const wrap = $("#toasts");
+    const el = document.createElement("div");
+    el.className = "toast " + kind;
+    el.textContent = msg;
+    wrap.appendChild(el);
+    setTimeout(() => {
+        el.style.transition = "opacity .25s";
+        el.style.opacity = "0";
+        setTimeout(() => el.remove(), 260);
+    }, ttl);
+}
+
+/* ---------- network helpers ---------- */
+async function postJSON(url) {
+    const res = await fetch(url, { method: "POST" });
+    let body;
+    try { body = await res.json(); } catch { body = {}; }
+    if (!res.ok) throw new Error(body.error || res.statusText || ("HTTP " + res.status));
+    return body;
+}
+
+/* ---------- live status refresh (no full page reload) ---------- */
+let pollTimer = null;
+async function refreshStatus() {
+    try {
+        const r = await fetch("/api/status", { cache: "no-store" });
+        if (!r.ok) return;
+        const s = await r.json();
+
+        // session counter
+        $("#sessionCount").textContent = s.session_pages;
+
+        // gallery (cheap DOM diff)
+        const g = $("#gallery");
+        const empty = $("#emptyCaptures");
+        if (!s.captures.length) {
+            if (g) g.remove();
+            if (!empty) {
+                const div = document.createElement("div");
+                div.className = "empty";
+                div.id = "emptyCaptures";
+                div.innerHTML = 'No pages captured yet — press <kbd>C</kbd> in the desktop window.';
+                document.querySelector(".card:nth-of-type(2) .body").appendChild(div);
+            }
+        } else {
+            if (empty) empty.remove();
+            if (!g) {
+                const div = document.createElement("div");
+                div.className = "gallery";
+                div.id = "gallery";
+                document.querySelector(".card:nth-of-type(2) .body").appendChild(div);
+            }
+            // rebuild (gallery is small; full rewrite is fine and bullet-proof)
+            $("#gallery").innerHTML = s.captures.map((name, i) => `
+                <figure>
+                    <span class="badge">#${i+1}</span>
+                    <img src="/captures/${encodeURIComponent(name)}?t=${Date.now()}"
+                         alt="${name}" loading="lazy">
+                    <figcaption><span>${name}</span></figcaption>
+                </figure>`).join("");
         }
-        async function post(url, body) {
-            const res = await fetch(url, { method: 'POST', body });
-            if (!res.ok) throw new Error((await res.text()) || res.statusText);
-            return res.json();
+        $("#capPill").textContent = s.captures.length + " in buffer";
+
+        // last message
+        if (s.last_message) $("#lastMsg").textContent = s.last_message;
+    } catch (e) { /* swallow — next tick will retry */ }
+}
+function startPolling() {
+    if (pollTimer) return;
+    pollTimer = setInterval(refreshStatus, 4000);
+    refreshStatus();
+}
+
+/* ---------- action wiring ---------- */
+function busy(btn, on) { btn.disabled = !!on; }
+
+$("#finishBtn").onclick = async () => {
+    const btn = $("#finishBtn");
+    busy(btn, true);
+    try {
+        const r = await postJSON("/finish");
+        toast("PDF saved: " + (r.pdf_name || "scan"), "ok");
+        setTimeout(() => location.reload(), 600);   // refresh the saved-PDF table
+    } catch (e) { toast("Finish failed: " + e.message, "err"); }
+    finally    { busy(btn, false); }
+};
+
+$("#newSessBtn").onclick = async () => {
+    const btn = $("#newSessBtn");
+    busy(btn, true);
+    try {
+        await postJSON("/new-session");
+        toast("Started a new session", "ok");
+        setTimeout(() => location.reload(), 400);
+    } catch (e) { toast("New session failed: " + e.message, "err"); }
+    finally    { busy(btn, false); }
+};
+
+$("#deleteLastBtn").onclick = async () => {
+    const btn = $("#deleteLastBtn");
+    busy(btn, true);
+    try {
+        const r = await postJSON("/delete-last-page");
+        if (r.ok) toast("Last page deleted — " + r.session_pages + " page(s) left", "ok");
+        else      toast("No pages to delete", "err");
+        refreshStatus();
+    } catch (e) { toast("Delete failed: " + e.message, "err"); }
+    finally    { busy(btn, false); }
+};
+
+$("#quitBtn").onclick = async () => {
+    const pages = parseInt($("#sessionCount").textContent || "0", 10);
+    if (pages > 0) {
+        const ok = window.confirm(
+            pages + " page(s) are captured in this session.\n" +
+            "Save them as document_NNN.pdf before quitting?"
+        );
+        if (!ok) {
+            const discard = window.confirm(
+                "Discard the " + pages + " page(s) and quit without saving?"
+            );
+            if (!discard) return;     // user cancelled both
+            try {
+                await postJSON("/quit?discard=1");
+                toast("Discarded — quitting…", "ok");
+            } catch (e) { toast("Quit failed: " + e.message, "err"); }
+            return;
         }
-        async function refreshPage() {
-            // Cheap refresh so the gallery + PDF list update after C/D actions.
-            window.location.reload();
-        }
+        try {
+            await postJSON("/quit?save=1");
+            toast("Saved — quitting…", "ok");
+        } catch (e) { toast("Quit failed: " + e.message, "err"); }
+        return;
+    }
+    try { await postJSON("/quit"); toast("Quitting…", "ok"); }
+    catch (e) { toast("Quit failed: " + e.message, "err"); }
+};
 
-        document.getElementById('finishBtn').onclick = async () => {
-            const btn = document.getElementById('finishBtn');
-            btn.disabled = true;
-            try {
-                const r = await post('/finish');
-                show('PDF saved: ' + r.pdf_name + ' (' + r.session_pages + ' pages left)');
-                refreshPage();
-            } catch (e) {
-                show('Finish failed: ' + e.message, false);
-            } finally {
-                btn.disabled = false;
-            }
-        };
+/* ---------- keyboard shortcuts (mirror the desktop window) ---------- */
+window.addEventListener("keydown", (ev) => {
+    // ignore when typing in inputs
+    if (/^(input|textarea|select)$/i.test(ev.target.tagName)) return;
+    const k = ev.key.toLowerCase();
+    if      (k === "c") { /* capture is handled by the desktop window */ }
+    else if (k === "d") { $("#finishBtn").click(); }
+    else if (k === "n") { $("#newSessBtn").click(); }
+    else if (k === "x") { $("#deleteLastBtn").click(); }
+    else if (k === "q") { $("#quitBtn").click(); }
+});
 
-        document.getElementById('deleteLastBtn').onclick = async () => {
-            const btn = document.getElementById('deleteLastBtn');
-            btn.disabled = true;
-            try {
-                const r = await post('/delete-last-page');
-                if (r.ok) {
-                    show('Last page deleted - ' + r.session_pages + ' page(s) left');
-                } else {
-                    show('No pages to delete', false);
-                }
-                refreshPage();
-            } catch (e) {
-                show('Delete failed: ' + e.message, false);
-            } finally {
-                btn.disabled = false;
-            }
-        };
-
-        document.getElementById('quitBtn').onclick = async () => {
-            const pages = parseInt(sessionCount.textContent || '0', 10);
-            if (pages > 0) {
-                const ok = window.confirm(
-                    pages + ' page(s) are captured in this session.\n' +
-                    'Save them as scan_N.pdf before quitting?'
-                );
-                if (!ok) {
-                    const discard = window.confirm(
-                        'Discard the ' + pages + ' page(s) and quit without saving?'
-                    );
-                    if (!discard) return;  // user cancelled both
-                }
-            }
-            try {
-                await post('/quit');
-                show('Quitting… you can close this tab.');
-            } catch (e) {
-                show('Quit signal failed: ' + e.message, false);
-            }
-        };
-
-        document.getElementById('buildQrBtn').onclick = async () => {
-            const data = document.getElementById('qrInput').value.trim();
-            if (!data) { show('Enter a URL first.', false); return; }
-            const fd = new FormData(); fd.append('data', data);
-            try { const r = await post('/qr', fd); show('QR ready: ' + r.qr_url); }
-            catch (e) { show('QR failed: ' + e.message, false); }
-        };
-    </script>
+/* ---------- go ---------- */
+startPolling();
+</script>
 </body>
 </html>

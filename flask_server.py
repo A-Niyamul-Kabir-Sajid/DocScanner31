@@ -24,6 +24,7 @@ from flask import (
     abort,
     redirect,
     render_template,
+    request,
     send_from_directory,
     url_for,
 )
@@ -201,6 +202,61 @@ class FlaskServer:
                 "ok": removed,
                 "session_pages": self.session.page_count(),
                 "last_message": self.session.last_message,
+            }
+
+        # ------------------------------------------------------------------ #
+        # New endpoints for the modernized control panel.
+        # All four are POST-friendly: the buttons in the UI POST to them and
+        # the JSON body is ignored (kept light for a Raspberry Pi 5).
+        # ------------------------------------------------------------------ #
+        @app.route("/finish", methods=["POST"])
+        def finish_view():
+            pdf_path = self.session.finish_pdf()
+            return {
+                "ok": pdf_path is not None,
+                "pdf_name": pdf_path.name if pdf_path else None,
+                "session_pages": self.session.page_count(),
+                "last_message": self.session.last_message,
+            }
+
+        @app.route("/new-session", methods=["POST"])
+        def new_session_view():
+            self.session.start_new_document()
+            return {
+                "ok": True,
+                "session_pages": self.session.page_count(),
+                "last_message": self.session.last_message,
+            }
+
+        @app.route("/quit", methods=["POST"], endpoint="ui_quit")
+        def quit_view():
+            # Optional ?save=1 / ?discard=1 hints from the UI; the desktop
+            # window handles the actual save/discard decision before calling
+            # request_quit(), but we accept the hints for symmetry.
+            args = request.args
+            if args.get("save") == "1":
+                self.session.finish_pdf()
+            # "discard=1" is implicit: we just quit without saving.
+            self.session.request_quit()
+            return {"ok": True, "last_message": self.session.last_message}
+
+        @app.route("/api/status")
+        def api_status():
+            """Lightweight JSON used by the polling loop in the UI."""
+            captures = _list_captures(scanned_dir)
+            pdfs = _list_document_pdfs(pdf_dir)
+            qrs = _list_document_qrs(qr_dir)
+            latest = pdfs[-1] if pdfs else None
+            return {
+                "session_pages": self.session.page_count(),
+                "captures": [p.name for p in captures],
+                "pdfs": [num for num, _ in pdfs],
+                "qrs": [num for num, _ in qrs],
+                "latest": {
+                    "num": latest[0] if latest else 0,
+                    "pdf": latest[1].name if latest else None,
+                },
+                "last_message": getattr(self.session, "last_message", None),
             }
 
         return app

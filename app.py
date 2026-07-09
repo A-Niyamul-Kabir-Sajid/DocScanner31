@@ -137,6 +137,50 @@ def _now_ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _probe_camera_url(source: object, *, timeout_s: float = 1.5) -> Optional[str]:
+    """Best-effort reachability check for an OpenCV source.
+
+    ``source`` is either an int (local webcam index) or a string URL such
+    as ``"http://192.168.43.1:8080/video"``.  For URLs we open a TCP
+    socket to ``host:port``; if the connect succeeds (or fails with
+    something other than "host unreachable / timeout") we return ``None``
+    so the caller's expensive ``cv2.VideoCapture(...)`` retry path is the
+    one that decides.  When the host is plainly unreachable we return a
+    short, human-friendly error string so it can be shown on the offline
+    canvas *and* logged once at startup.
+
+    Returns ``None`` for local indices (they have no host to probe) and
+    for sources we don't recognise.
+    """
+    if not isinstance(source, str) or not source.lower().startswith(("http://", "https://", "rtsp://")):
+        return None
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(source)
+        host = u.hostname
+        port = u.port or (443 if u.scheme == "https" else 80)
+    except Exception as exc:  # pragma: no cover - defensive
+        return f"could not parse source URL ({exc})"
+    if not host:
+        return "source URL has no host"
+    try:
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout_s)
+            s.connect((host, int(port)))
+        return None
+    except socket.timeout:
+        return (f"timed out talking to {host}:{port} -- is DroidCam on the "
+                f"same Wi-Fi as this PC?")
+    except OSError as exc:
+        # ``ConnectionRefusedError`` -> port closed on that host
+        # ``socket.gaierror`` -> DNS / wrong subnet
+        # ``[Errno 10051]`` -> network unreachable on Windows
+        return (f"{exc} -- check the URL and that both devices share the "
+                f"same Wi-Fi (this PC sees {host} but nothing is "
+                f"listening).")
+
+
 def _draw_text(
     canvas: np.ndarray,
     text: str,
@@ -163,6 +207,122 @@ def _draw_text(
 
 
 # --------------------------------------------------------------------------- #
+# UI primitives
+UI_BG = (20, 25, 45)
+UI_PANEL = (30, 36, 64)
+UI_PANEL_ALT = (40, 48, 90)
+UI_BORDER = (58, 70, 110)
+UI_TEXT = (230, 236, 255)
+UI_MUTED = (138, 147, 184)
+UI_ACCENT = (79, 140, 255)
+UI_SUCCESS = (43, 212, 156)
+UI_WARN = (255, 181, 71)
+UI_ERR = (255, 93, 108)
+UI_KEY_BG = (40, 48, 80)
+UI_HOTKEY_BG = (28, 32, 56)
+UI_STATUS_BAR_H = 44
+UI_HOTKEY_BAR_H = 40
+
+
+def _ui_panel(canvas, x, y, w, h, *, fill=UI_PANEL, border=UI_BORDER, border_thickness=1):
+    ch, cw = canvas.shape[:2]
+    x0 = max(0, int(x)); y0 = max(0, int(y))
+    x1 = min(cw, int(x + w)); y1 = min(ch, int(y + h))
+    if x1 <= x0 or y1 <= y0:
+        return
+    cv2.rectangle(canvas, (x0, y0), (x1 - 1, y1 - 1), fill, thickness=-1)
+    if border is not None and border_thickness > 0:
+        cv2.rectangle(canvas, (x0, y0), (x1 - 1, y1 - 1), border, thickness=border_thickness)
+
+
+def _ui_chip(canvas, text, x, y, *, fg=UI_TEXT, bg=UI_KEY_BG, scale=0.5, thickness=1, pad=8):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
+    w = tw + pad * 2
+    h = th + baseline + pad * 2
+    ch, cw = canvas.shape[:2]
+    x0 = max(0, int(x)); y0 = max(0, int(y))
+    x1 = min(cw, int(x + w)); y1 = min(ch, int(y + h))
+    if x1 <= x0 or y1 <= y0:
+        return
+    cv2.rectangle(canvas, (x0, y0), (x1 - 1, y1 - 1), bg, thickness=-1)
+    cv2.rectangle(canvas, (x0, y0), (x1 - 1, y1 - 1), UI_BORDER, thickness=1)
+    ty = y0 + pad + th
+    cv2.putText(canvas, text, (x0 + pad, ty), font, scale, fg, thickness, cv2.LINE_AA)
+
+
+def _ui_key_chip(canvas, key, label, x, y, *, accent=UI_ACCENT, scale=0.45):
+    key_text = f"[{key}]"
+    _ui_chip(canvas, key_text, x, y, fg=UI_TEXT, bg=accent, scale=scale, pad=6)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    key_w = cv2.getTextSize(key_text, font, scale, 1)[0][0] + 12
+    text_x = x + key_w + 8
+    _draw_text(canvas, label, (text_x, y + 14), color=UI_MUTED, bg=None, scale=scale)
+    label_w = cv2.getTextSize(label, font, scale, 1)[0][0]
+    return text_x + label_w + 18
+
+
+def _ui_status_bar(canvas, *, title, subtitle="", pills=None):
+    h, w = canvas.shape[:2]
+    bar_h = UI_STATUS_BAR_H
+    cv2.rectangle(canvas, (0, 0), (w, bar_h), UI_PANEL, thickness=-1)
+    cv2.rectangle(canvas, (0, 0), (w, 3), UI_ACCENT, thickness=-1)
+    cv2.line(canvas, (0, bar_h - 1), (w, bar_h - 1), UI_BORDER, thickness=1)
+    _draw_text(canvas, title, (16, 28), color=UI_TEXT, bg=None, scale=0.7, thickness=2)
+    if subtitle:
+        _draw_text(canvas, subtitle, (16, bar_h - 6),
+                   color=UI_MUTED, bg=None, scale=0.4, thickness=1)
+    if pills:
+        cx = w - 16
+        for text, fg, bg in reversed(list(pills)):
+            (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            chip_w = tw + 16
+            cx -= chip_w
+            _ui_chip(canvas, text, cx, 10, fg=fg, bg=bg, scale=0.5, pad=8)
+            cx -= 8
+
+
+def _ui_hotkey_bar(canvas, keys, *, message=None, y=None):
+    """Draw the bottom hotkey rail.
+
+    Parameters
+    ----------
+    canvas : np.ndarray
+        Target BGR canvas.
+    keys : list[tuple[str, str, tuple]]
+        ``(key, label, accent_bgr)`` chips.
+    message : str, optional
+        Soft message drawn just above the rail (e.g. "saved as scan_1.pdf").
+    y : int, optional
+        Top edge of the rail.  Defaults to the very bottom of the canvas.
+    """
+    h, w = canvas.shape[:2]
+    bar_h = UI_HOTKEY_BAR_H
+    top = h - bar_h if y is None else int(y)
+    cv2.rectangle(canvas, (0, top), (w, top + bar_h), UI_HOTKEY_BG, thickness=-1)
+    cv2.line(canvas, (0, top), (w, top), UI_BORDER, thickness=1)
+    if message:
+        _draw_text(canvas, message, (16, top - 8),
+                   color=UI_WARN, bg=None, scale=0.45, thickness=1)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.45
+    widths = []
+    total = 0
+    for key, label, _accent in keys:
+        key_text = f"[{key}]"
+        kw = cv2.getTextSize(key_text, font, scale, 1)[0][0] + 12
+        lw = cv2.getTextSize(label, font, scale, 1)[0][0]
+        chip_total = kw + 8 + lw + 18
+        widths.append(chip_total)
+        total += chip_total
+    x = max(16, (w - total) // 2)
+    y = top + 10
+    for (key, label, accent), w_each in zip(keys, widths):
+        _ui_key_chip(canvas, key, label, x, y,
+                     accent=accent or UI_ACCENT, scale=scale)
+        x += w_each
+
+
 # Grid-builder helpers (used by _render_live)
 # --------------------------------------------------------------------------- #
 def _to_bgr(img: np.ndarray) -> np.ndarray:
@@ -227,6 +387,10 @@ class ScanSession:
     web_host: str = DEFAULT_WEB_HOST
     web_port: int = DEFAULT_WEB_PORT
     scan_mode: str = SCAN_MODE
+    # Display mode for the OpenCV window.  ``False`` (default) opens a
+    # resizable window of (camera_width x camera_height); pass
+    # ``--fullscreen`` to fill the whole monitor instead.
+    window_fullscreen: bool = False
 
     # Bookkeeping populated by __post_init__.
     scanned_dir: Path = field(init=False)
@@ -1342,6 +1506,12 @@ class ScanSession:
 
         if frame is None:
             ok, frame = self.camera.read()
+        else:
+            # Caller already supplied a frame (smoke tests, off-screen
+            # preview, replay).  Optimistically trust it - the
+            # camera_status() branch below will still divert to the
+            # offline renderer if the camera is actually broken.
+            ok = True
 
         # If the camera is offline (no handle / read failed / no quad
         # possible on an all-black frame), short-circuit to a dedicated
@@ -1384,32 +1554,44 @@ class ScanSession:
         except Exception:
             return self._render_live_fallback(frame)
 
-        # HUD (drawn on top of the stacked grid - the canvas is wider/taller
-        # than the raw frame so coordinates are relative to the grid).
-        _draw_text(
-            canvas,
-            f"state: LIVE  pages: {self.page_count()}  mode: {self.scan_mode}  conf {detection.confidence:.2f}",
-            (10, 30),
-            color=(0, 255, 0),
-            bg=(0, 0, 0),
-        )
-        _draw_text(
-            canvas,
-            "[C] capture   [D] finish PDF   [X] delete last page   [M] cycle mode   [N] (after D)   [Q] quit",
-            (10, 60),
-            color=(255, 255, 255),
-            bg=(0, 0, 0),
-        )
-        if self.last_message:
-            _draw_text(
-                canvas,
-                self.last_message,
-                (10, 90),
-                color=(0, 0, 0) if self.auto_capture_enabled else (255, 255, 255),
-                bg=(0, 0, 0) if not self.auto_capture_enabled else None,
-            )
+        h, w = canvas.shape[:2]
+
         # ------------------------------------------------------------------
-        # AUTO pill - only when the feature is on.
+        # Top status bar
+        # ------------------------------------------------------------------
+        page_label = f"{self.page_count()} page{'s' if self.page_count() != 1 else ''}"
+        conf_label = f"conf {detection.confidence:.2f}"
+        _ui_status_bar(
+            canvas,
+            title="Smart Document Scanner",
+            subtitle=self.scan_mode,
+            pills=[
+                ("LIVE", UI_TEXT, UI_SUCCESS),
+                (page_label, UI_TEXT, UI_ACCENT),
+                (self.scan_mode, UI_TEXT, UI_KEY_BG),
+                (conf_label, UI_TEXT, UI_KEY_BG),
+            ],
+        )
+
+        # ------------------------------------------------------------------
+        # Bottom hotkey rail - leaves room above for thumbs.
+        # ------------------------------------------------------------------
+        _ui_hotkey_bar(
+            canvas,
+            [
+                ("C", "capture", UI_ACCENT),
+                ("D", "finish PDF", UI_SUCCESS),
+                ("X", "delete last page", UI_WARN),
+                ("M", "cycle mode", UI_KEY_BG),
+                ("N", "new document", UI_KEY_BG),
+                ("Q", "quit", UI_ERR),
+            ],
+            message=self.last_message or None,
+            y=h - UI_HOTKEY_BAR_H,
+        )
+
+        # ------------------------------------------------------------------
+        # AUTO pill - only when the feature is on (just below status bar).
         # ------------------------------------------------------------------
         if self.auto_capture_enabled:
             phase = self._auto_capture_phase
@@ -1418,77 +1600,75 @@ class ScanSession:
                     f"AUTO | captured p{self.page_count()} | "
                     f"cooldown {self.auto_capture_cooldown_s:.1f}s"
                 )
-                pill_color = (255, 255, 255)
-                pill_bg = (0, 170, 90)
+                pill_color, pill_bg = UI_TEXT, UI_SUCCESS
             elif phase == "identifying":
                 c, r = self._auto_capture_progress
                 pill_text = f"AUTO | identifying {c}/{r}"
-                pill_color = (255, 255, 255)
-                pill_bg = (0, 140, 255)
+                pill_color, pill_bg = UI_TEXT, UI_ACCENT
             elif phase == "idle":
                 pill_text = "AUTO | waiting for document"
-                pill_color = (255, 255, 255)
-                pill_bg = (90, 90, 90)
+                pill_color, pill_bg = UI_TEXT, UI_MUTED
             else:
-                pill_text = ""
-                pill_bg = None
+                pill_text, pill_bg = "", None
             if pill_text:
-                _draw_text(canvas, pill_text, (10, 118), color=pill_color, bg=pill_bg)
-        # gate is currently rejecting (so the user knows why C did nothing),
-        # green when the next C will succeed.
-        readout_y = grid_label_bottom(panels, DEBUG_GRID_SCALE) + 20
+                _ui_chip(canvas, pill_text, 10, UI_STATUS_BAR_H + 8,
+                         fg=pill_color, bg=pill_bg, scale=0.5, thickness=2, pad=10)
+
+        # ------------------------------------------------------------------
+        # Quality readout just above the hotkey rail (so it's still visible).
+        # yellow when the gate is currently rejecting, green when C will succeed.
+        # ------------------------------------------------------------------
+        rail_top = h - UI_HOTKEY_BAR_H
+        readout_y = min(rail_top - 30, grid_label_bottom(panels, DEBUG_GRID_SCALE) + 20)
         if self.last_quality is not None:
             q = self.last_quality
-            color = (0, 255, 0) if q.ok else (0, 140, 255)
-            _draw_text(
-                canvas,
+            qcolor = UI_SUCCESS if q.ok else UI_WARN
+            qtext = (
                 f"quality: {q.reason or 'ok'} "
                 f"(blur={q.blur:.0f} bright={q.brightness:.0f} "
-                f"motion={q.motion:.1f}px)",
-                (10, readout_y),
-                color=color,
-                bg=(0, 0, 0),
+                f"motion={q.motion:.1f}px)"
             )
         else:
-            _draw_text(canvas, "quality: -- (press C to sample)", (10, readout_y),
-                       color=(180, 180, 180), bg=(0, 0, 0))
+            qcolor = UI_MUTED
+            qtext = "quality: -- (press C to sample)"
+        _ui_chip(canvas, qtext, 10, readout_y, fg=UI_TEXT, bg=qcolor,
+                 scale=0.5, thickness=1, pad=8)
 
+        # ------------------------------------------------------------------
         # Thumb of the final processed page in the bottom-right of the grid,
-        # so the user can see what would be saved on C.
+        # so the user can see what would be saved on C.  Framed with the
+        # success accent.
+        # ------------------------------------------------------------------
         thumb = _make_thumb(processed, size=160)
-        if thumb is not None and canvas.shape[1] > thumb.shape[1] + 20:
-            tx = canvas.shape[1] - thumb.shape[1] - 20
-            ty = canvas.shape[0] - thumb.shape[0] - 20
-            canvas[ty : ty + thumb.shape[0], tx : tx + thumb.shape[1]] = thumb
-            cv2.rectangle(
-                canvas,
-                (tx - 2, ty - 2),
-                (tx + thumb.shape[1] + 2, ty + thumb.shape[0] + 2),
-                (255, 255, 255),
-                1,
-            )
-            _draw_text(canvas, "would save", (tx, ty - 8),
-                       color=(255, 255, 255), bg=(0, 0, 0), scale=0.5)
+        if thumb is not None and w > thumb.shape[1] + 20:
+            tx = w - thumb.shape[1] - 20
+            ty = rail_top - thumb.shape[0] - 30
+            if ty > UI_STATUS_BAR_H + 10:
+                canvas[ty : ty + thumb.shape[0], tx : tx + thumb.shape[1]] = thumb
+                _ui_panel(canvas, tx - 4, ty - 4,
+                          thumb.shape[1] + 8, thumb.shape[0] + 8,
+                          fill=UI_PANEL, border=UI_SUCCESS, border_thickness=2)
+                _ui_chip(canvas, "would save", tx, ty - 12,
+                         fg=UI_TEXT, bg=UI_SUCCESS, scale=0.45, thickness=1, pad=6)
 
+        # ------------------------------------------------------------------
         # Thumb of the last successfully captured page in the bottom-left
         # so the user has a visible confirmation of which page ``X`` will
         # delete.  Falls back to a small "no pages yet" plaque when the
         # session is empty.
+        # ------------------------------------------------------------------
         last_thumb = _make_thumb(self.pages[-1], size=160) if self.pages else None
-        if last_thumb is not None and canvas.shape[0] > last_thumb.shape[0] + 20:
+        if last_thumb is not None and h > last_thumb.shape[0] + 20:
             lx = 20
-            ly = canvas.shape[0] - last_thumb.shape[0] - 20
-            canvas[ly : ly + last_thumb.shape[0], lx : lx + last_thumb.shape[1]] = last_thumb
-            cv2.rectangle(
-                canvas,
-                (lx - 2, ly - 2),
-                (lx + last_thumb.shape[1] + 2, ly + last_thumb.shape[0] + 2),
-                (255, 220, 80),
-                2,
-            )
-            label = f"last page ({self.page_count()}) - [X] deletes"
-            _draw_text(canvas, label, (lx, ly - 8),
-                       color=(255, 220, 80), bg=(0, 0, 0), scale=0.5)
+            ly = rail_top - last_thumb.shape[0] - 30
+            if ly > UI_STATUS_BAR_H + 10:
+                canvas[ly : ly + last_thumb.shape[0], lx : lx + last_thumb.shape[1]] = last_thumb
+                _ui_panel(canvas, lx - 4, ly - 4,
+                          last_thumb.shape[1] + 8, last_thumb.shape[0] + 8,
+                          fill=UI_PANEL, border=UI_WARN, border_thickness=2)
+                label = f"last page ({self.page_count()}) - [X] deletes"
+                _ui_chip(canvas, label, lx, ly - 12,
+                         fg=UI_TEXT, bg=UI_WARN, scale=0.45, thickness=1, pad=6)
 
         if self.show_exit_modal:
             self._draw_exit_modal(canvas)
@@ -1499,89 +1679,84 @@ class ScanSession:
     def _render_camera_offline(
         self, status: dict, last_frame: Optional[np.ndarray]
     ) -> np.ndarray:
-        """Draw the 'camera not found' banner with a live retry countdown.
-
-        ``last_frame`` is the placeholder frame the camera returned (an
-        all-black image when the device is unreachable).  We use it as
-        the canvas so the window still has the configured resolution.
-        """
+        """Modern 'camera not found' card with a centred status grid and a
+        soft red wash so the offline state is impossible to miss."""
         h, w = self.camera_height, self.camera_width
         canvas = (
             last_frame.copy()
             if (last_frame is not None and last_frame.shape[:2] == (h, w))
             else np.zeros((h, w, 3), dtype=np.uint8)
         )
-        # Soft red wash so the "offline" state is impossible to miss.
+        # Base wash: deep navy + soft red overlay so the state is impossible
+        # to miss while staying on-palette with the rest of the UI.
         overlay = canvas.copy()
-        cv2.rectangle(overlay, (0, 0), (w, h), (32, 16, 16), thickness=-1)
-        cv2.addWeighted(overlay, 0.35, canvas, 0.65, 0, canvas)
+        cv2.rectangle(overlay, (0, 0), (w, h), UI_BG, thickness=-1)
+        cv2.addWeighted(overlay, 0.85, canvas, 0.15, 0, canvas)
+        wash = canvas.copy()
+        cv2.rectangle(wash, (0, 0), (w, h), (60, 26, 38), thickness=-1)
+        cv2.addWeighted(wash, 0.45, canvas, 0.55, 0, canvas)
 
-        # Header
-        _draw_text(
-            canvas,
-            "CAMERA NOT FOUND",
-            (20, 50),
-            color=(255, 255, 255),
-            bg=(40, 0, 0),
-            scale=1.1,
-            thickness=2,
-        )
-
-        # Source / backend
         src = status.get("source", "?")
         backend = status.get("backend", "?")
-        _draw_text(
-            canvas,
-            f"source: {src}",
-            (20, 90),
-            color=(255, 220, 220),
-            bg=(40, 0, 0),
-        )
-        _draw_text(
-            canvas,
-            f"backend: {backend}",
-            (20, 120),
-            color=(255, 220, 220),
-            bg=(40, 0, 0),
-        )
-
-        # Reason
         err = status.get("error") or "no signal"
-        _draw_text(
-            canvas,
-            f"reason: {err}",
-            (20, 150),
-            color=(255, 200, 200),
-            bg=(40, 0, 0),
-        )
-
-        # Retry countdown (driven by ``time.monotonic``).
         retry_in = float(status.get("retry_in") or 0.0)
-        _draw_text(
+
+        # Top status bar with offline pill.
+        _ui_status_bar(
             canvas,
-            f"retrying in {retry_in:0.1f}s ...",
-            (20, 190),
-            color=(255, 255, 0),
-            bg=(40, 0, 0),
+            title="Camera offline",
+            subtitle="retrying to reach the camera…",
+            pills=[
+                ("OFFLINE", UI_TEXT, UI_ERR),
+            ],
         )
 
-        # Help text
-        _draw_text(
-            canvas,
-            "Tip: start DroidCam / IP Webcam, then verify the URL.",
-            (20, 230),
-            color=(220, 220, 220),
-            bg=(40, 0, 0),
-        )
+        # Centred "error card" with reason, source/backend, retry countdown.
+        card_w = min(w - 80, 720)
+        card_h = 280
+        card_x = (w - card_w) // 2
+        card_y = UI_STATUS_BAR_H + 40
+        _ui_panel(canvas, card_x, card_y, card_w, card_h,
+                  fill=UI_PANEL_ALT, border=UI_ERR, border_thickness=2)
 
-        # Footer (keep the normal hotkey hints visible)
-        _draw_text(
+        cx = card_x + 32
+        cy = card_y + 24
+
+        # Big banner inside the card.
+        _draw_text(canvas, "! Camera not found", (cx, cy + 30),
+                   color=UI_ERR, bg=None, scale=1.0, thickness=2)
+        cy += 60
+
+        def _row(label, value, *, value_color=UI_TEXT):
+            nonlocal cy
+            _draw_text(canvas, label, (cx, cy + 22),
+                       color=UI_MUTED, bg=None, scale=0.55, thickness=1)
+            _draw_text(canvas, str(value), (cx + 140, cy + 22),
+                       color=value_color, bg=None, scale=0.55, thickness=1)
+            cy += 36
+
+        _row("source", src)
+        _row("backend", backend)
+        _row("reason", err, value_color=UI_WARN)
+        _row("retry in", f"{retry_in:0.1f}s", value_color=UI_ACCENT)
+
+        # Tip pinned to the bottom of the card.
+        tip_y = card_y + card_h - 50
+        cv2.line(canvas, (cx, tip_y - 18), (card_x + card_w - 32, tip_y - 18),
+                 UI_BORDER, thickness=1)
+        _draw_text(canvas, "Tip: open DroidCam / IP Webcam, then verify the URL.",
+                   (cx, tip_y + 12),
+                   color=UI_MUTED, bg=None, scale=0.5, thickness=1)
+
+        # Bottom hotkey rail - only Q to quit makes sense in this state.
+        retry_msg = (
+            f"app keeps polling every {CAMERA_RETRY_SECONDS:.0f}s "
+            "until the camera is back"
+        )
+        _ui_hotkey_bar(
             canvas,
-            "[Q] quit   (app keeps polling every "
-            f"{CAMERA_RETRY_SECONDS:.0f}s until the camera is back)",
-            (10, h - 20),
-            color=(180, 180, 180),
-            bg=(0, 0, 0),
+            [("Q", "quit", UI_ERR)],
+            message=retry_msg,
         )
 
         if self.show_exit_modal:
@@ -1590,23 +1765,51 @@ class ScanSession:
 
     # ------------------------------------------------------------------ #
     def _render_live_fallback(self, frame: np.ndarray) -> np.ndarray:
-        """Single-tile fallback when ``process_with_debug`` or stacking fails."""
+        """Single-tile fallback when ``process_with_debug`` or stacking fails.
+
+        Modern chrome (top status bar + bottom hotkey rail) wraps the raw
+        frame so the user still sees the state and can capture / finish.
+        """
         try:
             processed, detection = self.processor.process(frame)
-            canvas = DocumentProcessor.draw_overlay(frame, detection, processed_preview=processed)
+            canvas = DocumentProcessor.draw_overlay(
+                frame, detection, processed_preview=processed
+            )
         except Exception:
             canvas = frame.copy()
             _draw_text(canvas, "pipeline error - showing raw frame",
-                       (10, 30), color=(0, 0, 255), bg=(0, 0, 0))
+                       (10, 30), color=UI_ERR, bg=UI_PANEL)
 
-        _draw_text(canvas, f"state: LIVE  pages: {self.page_count()}  mode: {self.scan_mode}",
-                   (10, 60), color=(0, 255, 0), bg=(0, 0, 0))
-        _draw_text(canvas,
-                   "[C] capture   [D] finish PDF   [X] delete last page   [M] cycle mode   [N] (after D)   [Q] quit",
-                   (10, 90), color=(255, 255, 255), bg=(0, 0, 0))
-        if self.last_message:
-            _draw_text(canvas, self.last_message, (10, 120),
-                       color=(0, 255, 255), bg=(0, 0, 0))
+        # Bottom strip so the camera frame doesn't bleed under the chrome.
+        _ui_panel(canvas, 0, canvas.shape[0] - UI_HOTKEY_BAR_H,
+                  canvas.shape[1], UI_HOTKEY_BAR_H,
+                  fill=UI_HOTKEY_BG, border=UI_BORDER, border_thickness=1)
+
+        _ui_status_bar(
+            canvas,
+            title="Smart Document Scanner",
+            subtitle="live preview (fallback)",
+            pills=[
+                ("LIVE", UI_TEXT, UI_SUCCESS),
+                (f"{self.page_count()} page{'s' if self.page_count() != 1 else ''}",
+                 UI_TEXT, UI_ACCENT),
+                (self.scan_mode, UI_TEXT, UI_KEY_BG),
+            ],
+        )
+
+        _ui_hotkey_bar(
+            canvas,
+            [
+                ("C", "capture", UI_ACCENT),
+                ("D", "finish PDF", UI_SUCCESS),
+                ("X", "delete last page", UI_WARN),
+                ("M", "cycle mode", UI_KEY_BG),
+                ("N", "new document", UI_KEY_BG),
+                ("Q", "quit", UI_ERR),
+            ],
+            message=self.last_message or None,
+        )
+
         if self.show_exit_modal:
             self._draw_exit_modal(canvas)
         return canvas
@@ -1616,42 +1819,89 @@ class ScanSession:
         # NOTE: the camera frame is intentionally NOT drawn here - per spec.
         h, w = self.camera_height, self.camera_width
         canvas = np.zeros((h, w, 3), dtype=np.uint8)
-        canvas[:] = (32, 32, 32)
+        canvas[:] = UI_BG
 
-        _draw_text(canvas, "state: PDF_VIEW", (10, 30),
-                   color=(0, 255, 255), bg=(0, 0, 0))
-        _draw_text(canvas, "Document saved. Scan the QR or open the URL below.",
-                   (10, 60), color=(255, 255, 255), bg=(0, 0, 0))
-
-        y = 110
+        # Top status bar
+        page_label = "0 pages"
         if self.last_pdf_path is not None:
             n_pages = max(self.page_count_for_pdf(self.last_pdf_path), 0)
-            _draw_text(canvas, f"PDF: {self.last_pdf_path.name}  ({n_pages} pages)",
-                       (10, y), color=(255, 255, 255), bg=(0, 0, 0))
-            y += 30
+            page_label = f"{n_pages} page{'s' if n_pages != 1 else ''}"
+        _ui_status_bar(
+            canvas,
+            title="Document saved",
+            subtitle="scan the QR or open the URL",
+            pills=[
+                ("PDF_VIEW", UI_TEXT, UI_SUCCESS),
+                (page_label, UI_TEXT, UI_ACCENT),
+            ],
+        )
+
+        # Bottom hotkey rail
+        _ui_hotkey_bar(
+            canvas,
+            [
+                ("N", "new document", UI_ACCENT),
+                ("Q", "quit", UI_ERR),
+            ],
+            message=self.last_message or None,
+            y=h - UI_HOTKEY_BAR_H,
+        )
+
+        # Centred info card holding the file / url / QR.
+        card_w, card_h = 720, 420
+        card_x = (w - card_w) // 2
+        card_y = UI_STATUS_BAR_H + (h - UI_STATUS_BAR_H - UI_HOTKEY_BAR_H - card_h) // 2
+        _ui_panel(canvas, card_x, card_y, card_w, card_h,
+                  fill=UI_PANEL_ALT, border=UI_SUCCESS, border_thickness=2)
+
+        # Header
+        _draw_text(canvas, "! Document saved",
+                   (card_x + 24, card_y + 40),
+                   color=UI_SUCCESS, scale=0.9, thickness=2)
+        _draw_text(canvas, "scan the QR or open the URL below",
+                   (card_x + 24, card_y + 70),
+                   color=UI_MUTED, scale=0.55, thickness=1)
+
+        # PDF name row
+        row_y = card_y + 110
+        if self.last_pdf_path is not None:
+            n_pages = max(self.page_count_for_pdf(self.last_pdf_path), 0)
+            _draw_text(canvas, f"PDF: {self.last_pdf_path.name}",
+                       (card_x + 24, row_y),
+                       color=UI_TEXT, scale=0.55, thickness=1)
+            row_y += 28
+            _draw_text(canvas, f"pages: {n_pages}",
+                       (card_x + 24, row_y),
+                       color=UI_TEXT, scale=0.55, thickness=1)
+            row_y += 28
 
             host = self.flask_server.host or self.web_host
             port = self.flask_server.port or self.web_port
             url = f"http://{host}:{port}/{self.last_pdf_path.name}"
-            _draw_text(canvas, f"URL: {url}", (10, y), color=(180, 255, 180), bg=(0, 0, 0))
-            y += 30
+            _draw_text(canvas, f"URL: {url}",
+                       (card_x + 24, row_y),
+                       color=UI_ACCENT, scale=0.55, thickness=1)
 
+        # QR on the right side of the card
+        qr_size = 220
         if self.last_qr_path is not None and self.last_qr_path.exists():
             qr_img = cv2.imread(str(self.last_qr_path), cv2.IMREAD_COLOR)
             if qr_img is not None:
-                size = 220
-                qr_img = cv2.resize(qr_img, (size, size), interpolation=cv2.INTER_AREA)
-                x0 = w - size - 20
-                y0 = h - size - 60
-                canvas[y0:y0+size, x0:x0+size] = qr_img
-                cv2.rectangle(canvas, (x0-2, y0-2), (x0+size+2, y0+size+2), (255, 255, 255), 2)
+                qr_img = cv2.resize(qr_img, (qr_size, qr_size),
+                                    interpolation=cv2.INTER_AREA)
+                qx = card_x + card_w - qr_size - 24
+                qy = card_y + (card_h - qr_size) // 2
+                canvas[qy:qy + qr_size, qx:qx + qr_size] = qr_img
+                _ui_panel(canvas, qx - 6, qy - 6,
+                          qr_size + 12, qr_size + 12,
+                          fill=UI_PANEL, border=UI_ACCENT, border_thickness=2)
+                _ui_chip(canvas, "scan to download", qx, qy + qr_size + 12,
+                         fg=UI_TEXT, bg=UI_ACCENT, scale=0.45, thickness=1, pad=6)
 
-        _draw_text(canvas, "[N] new document   [Q] quit", (10, h - 30),
-                   color=(255, 255, 255), bg=(0, 0, 0))
-
-        if self.last_message:
-            _draw_text(canvas, self.last_message, (10, h - 60),
-                       color=(0, 255, 255), bg=(0, 0, 0))
+        # Divider near the bottom of the card
+        divider_y = card_y + card_h - 18
+        cv2.line(canvas, (card_x + 24, divider_y),
+                 (card_x + card_w - 24, divider_y), UI_BORDER, 1)
 
         if self.show_exit_modal:
             self._draw_exit_modal(canvas)
@@ -1660,22 +1910,51 @@ class ScanSession:
 
     # ------------------------------------------------------------------ #
     def _draw_exit_modal(self, canvas: np.ndarray) -> None:
+        """Modern centred exit-confirm dialog with Y/N key chips.
+
+        The whole-screen overlay softens whatever is behind so the modal
+        reads as a focused decision surface.  Colors come from the new
+        palette so it stays consistent with the chrome in the other states.
+        """
         h, w = canvas.shape[:2]
-        box_w, box_h = 460, 200
+        # Soften the entire frame first so the modal really stands out.
+        dim = canvas.copy()
+        cv2.rectangle(dim, (0, 0), (w, h), UI_BG, thickness=-1)
+        cv2.addWeighted(dim, 0.55, canvas, 0.45, 0, canvas)
+
+        box_w, box_h = 520, 230
         x0 = (w - box_w) // 2
         y0 = (h - box_h) // 2
-        overlay = canvas.copy()
-        cv2.rectangle(overlay, (x0, y0), (x0 + box_w, y0 + box_h), (40, 40, 40), thickness=-1)
-        cv2.addWeighted(overlay, 0.92, canvas, 0.08, 0, canvas)
-        cv2.rectangle(canvas, (x0, y0), (x0 + box_w, y0 + box_h), (255, 255, 255), 2)
+
+        _ui_panel(canvas, x0, y0, box_w, box_h,
+                  fill=UI_PANEL_ALT, border=UI_WARN, border_thickness=2)
+
+        # Accent strip across the top of the modal so it pops even when
+        # overlaid on the LIVE grid (which is busy).
+        _ui_panel(canvas, x0, y0, box_w, 6,
+                  fill=UI_WARN, border=UI_WARN, border_thickness=0)
 
         title = "Exit Application?"
         if self.page_count() > 0 and self.last_pdf_path is None:
             title = "Save current document & Exit?"
 
-        _draw_text(canvas, title, (x0 + 20, y0 + 50), color=(0, 255, 255), scale=0.8)
-        _draw_text(canvas, "Press Y to confirm", (x0 + 20, y0 + 90), color=(255, 255, 255))
-        _draw_text(canvas, "Press N to cancel",  (x0 + 20, y0 + 120), color=(255, 255, 255))
+        _draw_text(canvas, title, (x0 + 28, y0 + 56),
+                   color=UI_TEXT, scale=0.9, thickness=2)
+
+        if self.page_count() > 0 and self.last_pdf_path is None:
+            subtitle = f"You have {self.page_count()} unsaved page(s)."
+        else:
+            subtitle = "Any unsaved progress will be lost."
+        _draw_text(canvas, subtitle, (x0 + 28, y0 + 92),
+                   color=UI_MUTED, scale=0.55, thickness=1)
+
+        # Y / N key chips on the bottom row of the modal.
+        chip_y = y0 + box_h - 64
+        y_chip_x = x0 + 28
+        n_chip_x = _ui_key_chip(canvas, "Y", "confirm", y_chip_x, chip_y, accent=UI_SUCCESS)
+        # gap then N chip
+        n_chip_x = max(n_chip_x + 28, y_chip_x + 200)
+        _ui_key_chip(canvas, "N", "cancel", n_chip_x, chip_y, accent=UI_ERR)
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -1698,19 +1977,36 @@ class ScanSession:
     def run(self) -> None:
         """Open the camera and pump the FSM until quit."""
         cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
-        # Default the OpenCV window to fullscreen so the LIVE / PDF_VIEW
-        # canvases fill the screen.  ``WINDOW_FULLSCREEN`` keeps the OS
-        # title bar hidden and is supported on Windows / macOS / Linux.
-        # If the platform rejects the property (some headless / WSL setups)
-        # the window simply stays in its normal (resizable) state.
-        try:
-            cv2.setWindowProperty(
-                WINDOW_TITLE,
-                cv2.WND_PROP_FULLSCREEN,
-                cv2.WINDOW_FULLSCREEN,
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("could not enable fullscreen window: %s", exc)
+
+        # Decide window mode.  The desktop users overwhelmingly prefer a
+        # resizable window (so they can see the taskbar / drag the window
+        # between monitors / use Win+arrow snap), so the default flipped
+        # to "windowed".  ``--fullscreen`` keeps the old behaviour.
+        if self.window_fullscreen:
+            # ``WINDOW_FULLSCREEN`` keeps the OS title bar hidden and is
+            # supported on Windows / macOS / Linux.  If the platform
+            # rejects the property (some headless / WSL setups) the
+            # window simply stays in its normal (resizable) state.
+            try:
+                cv2.setWindowProperty(
+                    WINDOW_TITLE,
+                    cv2.WND_PROP_FULLSCREEN,
+                    cv2.WINDOW_FULLSCREEN,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("could not enable fullscreen window: %s", exc)
+        else:
+            # Windowed mode: size the OpenCV canvas to whatever the user
+            # gave us (default 1280x720).  We give the OS a sensible
+            # aspect ratio and let the user resize afterwards.
+            try:
+                cv2.resizeWindow(
+                    WINDOW_TITLE,
+                    int(self.camera_width),
+                    int(self.camera_height),
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("could not resize window: %s", exc)
         try:
             while not self.quit_requested:
                 # Camera heartbeat FIRST: keeps the "retry in X.Xs"
@@ -1792,6 +2088,14 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
                    help="Output style for captured pages (default: %(default)s)")
     p.add_argument("--width", type=int, default=DEFAULT_CAMERA_WIDTH)
     p.add_argument("--height", type=int, default=DEFAULT_CAMERA_HEIGHT)
+    p.add_argument("--fullscreen", dest="fullscreen", action="store_true",
+                   default=False,
+                   help=("Open the OpenCV window in fullscreen mode (default: "
+                         "windowed, i.e. resizable)."))
+    p.add_argument("--windowed", dest="fullscreen", action="store_false",
+                   help=("Force windowed (resizable) mode.  This is the "
+                         "default; the flag exists for symmetry with "
+                         "--fullscreen."))
     p.add_argument("--no-quality-gate", action="store_true",
                    help="Bypass the QualityGate (useful for tuning the detector).")
     p.add_argument("--blur-min", type=float, default=None,
@@ -1877,6 +2181,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         web_host=args.host,
         web_port=args.port,
         scan_mode=args.scan_mode,
+        window_fullscreen=bool(args.fullscreen),
     )
 
     if args.no_quality_gate:
