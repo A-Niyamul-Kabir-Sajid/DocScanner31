@@ -243,6 +243,10 @@ class Camera:
         # ``is_open`` is the canonical "is the camera usable right now?" flag.
         self.is_open: bool = False
         self.last_open_error: Optional[str] = None
+        # Latches whether the most recent frame read succeeded.  ``try_reopen``
+        # uses this to decide whether to rebuild the picamera2 pipeline; a
+        # transient read failure should NOT trigger a full reconfigure.
+        self._last_read_ok: bool = False
 
         if self.backend == "picamera2":
             self._open_picamera2()
@@ -350,12 +354,59 @@ class Camera:
         when the source is reachable.
         """
         if self.backend == "picamera2":
-            # picamera2 currently raises on failure; we don't auto-recover
-            # it here. The Pi boot path is rarely the failure case the user
-            # is hitting (their crash is on Windows + DroidCam URL).
-            return self._pi_cam is not None
+            return self._reopen_picamera2()
         self._open_opencv(raise_on_failure=False)
         return self.is_open
+
+    def _reopen_picamera2(self) -> bool:
+        """Tear down and recreate the picamera2 pipeline on failure.
+
+        ``picamera2`` lacks a cheap "are you still alive?" probe, so when a
+        read raises (or the user explicitly closed the handle) we close
+        the current pipeline and instantiate a fresh ``Picamera2()``.  The
+        underlying libcamera context is reused but the sensor pipeline is
+        rebuilt, which is the only way to clear a stuck sensor state.
+        """
+        # If we already believe the camera is open AND a recent read
+        # succeeded we have nothing to do.  ``_last_read_ok`` tracks that
+        # so a transient ``capture_array`` failure isn't escalated to a
+        # full reconfigure on every single frame.
+        if (
+            self._pi_cam is not None
+            and self.is_open
+            and self._last_read_ok
+        ):
+            return True
+
+        if self._pi_cam is not None:
+            try:
+                self._pi_cam.stop()
+            except Exception:  # pragma: no cover - best-effort
+                logger.debug("picamera2 stop() raised during reopen; ignoring")
+            try:
+                self._pi_cam.close()
+            except Exception:  # pragma: no cover - best-effort
+                logger.debug("picamera2 close() raised during reopen; ignoring")
+            self._pi_cam = None
+            self.is_open = False
+            self._last_read_ok = False
+
+        # Re-open from scratch using the same parameters we stored at
+        # construction time.  _open_picamera2 also reapplies the focus
+        # controls, so a focused mount keeps its focus across reconnects.
+        try:
+            self._open_picamera2()
+            self.is_open = True
+            self._last_read_ok = True
+            self.last_open_error = None
+            return True
+        except Exception as exc:  # pragma: no cover - driver-specific
+            self.is_open = False
+            self._pi_cam = None
+            self._last_read_ok = False
+            self.last_open_error = f"picamera2 reopen failed: {exc}"
+            logger.warning(self.last_open_error)
+            return False
 
     # ------------------------------------------------------------------ #
     # Backend openers
@@ -406,7 +457,13 @@ class Camera:
                 "Falling back to whatever the sensor defaults to.",
                 focus_controls, exc,
             )
-
+        # Mark the pipeline as live.  Without this the LIVE loop spins
+        # forever in the "camera not found" overlay because ``read()``
+        # never had a reason to flip ``is_open``.  A freshly-started
+        # pipeline IS open; treat it as such.
+        self.is_open = True
+        self._last_read_ok = True
+        self.last_open_error = None
     # ------------------------------------------------------------------ #
     # Frame acquisition
     # ------------------------------------------------------------------ #
@@ -424,9 +481,27 @@ class Camera:
         if self.backend == "picamera2":
             if self._pi_cam is None:
                 empty = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+                self._last_read_ok = False
                 return False, empty
-            frame_rgb = self._pi_cam.capture_array()
+            try:
+                frame_rgb = self._pi_cam.capture_array()
+            except Exception as exc:  # pragma: no cover - driver-specific
+                logger.warning("picamera2 capture_array failed: %s", exc)
+                self.is_open = False
+                self._last_read_ok = False
+                self.last_open_error = f"capture_array: {exc}"
+                empty = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+                return False, empty
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            self._last_read_ok = True
+            # Only stamp is_open=True after the first successful frame;
+            # that way a configured-but-not-started pipeline (or a sensor
+            # that's wedged after start()) gets one retry before we mark
+            # it offline.  Cheap insurance against the "stop()/close() but
+            # is_open still True" race that used to plague the Pi path.
+            if not self.is_open:
+                self.is_open = True
+                self.last_open_error = None
             return True, frame_bgr
 
         if not self.is_open or self._cap is None:
@@ -459,6 +534,10 @@ class Camera:
             except Exception:  # pragma: no cover - best-effort cleanup
                 logger.exception("Error while closing picamera2")
             self._pi_cam = None
+        # Drop the recovery latch so a subsequent ``try_reopen`` knows it
+        # has to do real work rather than short-circuiting on stale state.
+        self.is_open = False
+        self._last_read_ok = False
 
     # ------------------------------------------------------------------ #
     # Context manager sugar
