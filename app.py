@@ -394,6 +394,14 @@ class ScanSession:
     # tests can mutate it without monkey-patching module-level globals.
     camera_autofocus: Optional[bool] = None
     camera_lens_position: Optional[float] = None
+    # Rotate captured frames before they leave ``Camera.read()``.  Use this
+    # when the camera module is physically mounted in portrait but the
+    # sensor still delivers landscape frames, or when you simply want the
+    # preview/output oriented as A4 portrait.  Allowed values:
+    # ``0`` (no rotation), ``90``, ``180``, ``270``.  Applied symmetrically
+    # on both OpenCV and picamera2 backends so the downstream detector /
+    # scanner code never has to know which way the sensor was facing.
+    camera_rotate: int = 0
     web_host: str = DEFAULT_WEB_HOST
     web_port: int = DEFAULT_WEB_PORT
     scan_mode: str = SCAN_MODE
@@ -514,6 +522,7 @@ class ScanSession:
                     backend=self.camera_backend,
                     autofocus=self.camera_autofocus,
                     lens_position=self.camera_lens_position,
+                    rotate=self.camera_rotate,
                 )
                 # The Camera constructor resolves "auto" to a concrete
                 # backend.  Reflect the resolved value back onto the session
@@ -528,6 +537,7 @@ class ScanSession:
                 self._camera.width = self.camera_width
                 self._camera.height = self.camera_height
                 self._camera.backend = self.camera_backend
+                self._camera.rotate = int(self.camera_rotate or 0)
                 self._camera._cap = None
                 self._camera._pi_cam = None
                 self._camera.is_open = False
@@ -2202,6 +2212,12 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
                    help="Output style for captured pages (default: %(default)s)")
     p.add_argument("--width", type=int, default=DEFAULT_CAMERA_WIDTH)
     p.add_argument("--height", type=int, default=DEFAULT_CAMERA_HEIGHT)
+    p.add_argument("--rotate", type=int, default=0, choices=[0, 90, 180, 270],
+                   help=("Rotate captured frames by N degrees clockwise "
+                         "before they leave the Camera wrapper.  Use 90 or "
+                         "270 to switch a landscape sensor into portrait "
+                         "orientation; 0 (default) keeps the sensor as-is. "
+                         "Applied on both OpenCV and picamera2 backends."))
     p.add_argument("--fullscreen", dest="fullscreen", action="store_true",
                    default=False,
                    help=("Open the OpenCV window in fullscreen mode (default: "
@@ -2294,6 +2310,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         camera_height=args.height,
         camera_autofocus=getattr(args, "autofocus", None),
         camera_lens_position=getattr(args, "lens_position", None),
+        camera_rotate=int(getattr(args, "rotate", 0) or 0),
         web_host=args.host,
         web_port=args.port,
         scan_mode=args.scan_mode,

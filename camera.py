@@ -216,6 +216,7 @@ class Camera:
         backend: str = "auto",
         autofocus: Optional[bool] = None,
         lens_position: Optional[float] = None,
+        rotate: int = 0,
     ) -> None:
         self.source = source
         self.width = width
@@ -224,6 +225,23 @@ class Camera:
         # collapse to "opencv"; "auto" picks by platform.
         self.backend = select_backend(source, backend)
         self._requested_backend = backend
+        # Rotation applied to every frame leaving ``read()``.  Useful when
+        # the camera module is physically mounted portrait-side or you just
+        # want the LIVE preview / scanner output in portrait orientation
+        # without rotating the sensor mount.  Allowed: 0, 90, 180, 270.
+        # Anything else is clamped to 0 with a warning so a typo in the
+        # CLI / config doesn't silently produce sideways scans.
+        try:
+            rot = int(rotate)
+        except (TypeError, ValueError):
+            rot = 0
+        if rot not in (0, 90, 180, 270):
+            logger.warning(
+                "Unsupported camera rotate=%r; expected 0/90/180/270. "
+                "Falling back to no rotation.", rotate,
+            )
+            rot = 0
+        self.rotate = rot
         # Focus knobs.  Pull the runtime defaults lazily so tests can patch
         # ``config.DEFAULT_*`` without importing this module first.
         try:
@@ -467,11 +485,34 @@ class Camera:
     # ------------------------------------------------------------------ #
     # Frame acquisition
     # ------------------------------------------------------------------ #
+    def _apply_rotate(self, frame: np.ndarray) -> np.ndarray:
+        """Rotate ``frame`` by ``self.rotate`` degrees clockwise.
+
+        Called on every successful frame leaving ``read()`` so the rest of
+        the pipeline (detector, scanner, LIVE overlay, PDF writer) sees a
+        consistently-oriented image regardless of how the sensor is
+        mounted.  Implemented with ``cv2.rotate`` because picamera2's
+        hardware transform doesn't support 90° rotations.
+
+        ``rotate == 0`` returns the frame untouched (fast path).
+        """
+        if frame is None or self.rotate == 0:
+            return frame
+        if self.rotate == 90:
+            return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        if self.rotate == 180:
+            return cv2.rotate(frame, cv2.ROTATE_180)
+        if self.rotate == 270:
+            return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        return frame
+
     def read(self) -> Tuple[bool, np.ndarray]:
         """Return ``(ok, frame)`` mirroring ``VideoCapture.read()``.
 
         For picamera2 the captured array is already RGB, so we convert to
-        BGR to keep the rest of the OpenCV pipeline unchanged.
+        BGR to keep the rest of the OpenCV pipeline unchanged.  Frames are
+        then rotated by ``self.rotate`` degrees clockwise so portrait-mode
+        camera mounts produce portrait-oriented output transparently.
 
         When the camera is offline (``is_open`` is False or the underlying
         handle was never created) we return ``(False, empty_frame)`` instead
@@ -493,6 +534,7 @@ class Camera:
                 empty = np.zeros((self.height, self.width, 3), dtype=np.uint8)
                 return False, empty
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            frame_bgr = self._apply_rotate(frame_bgr)
             self._last_read_ok = True
             # Only stamp is_open=True after the first successful frame;
             # that way a configured-but-not-started pipeline (or a sensor
@@ -520,7 +562,8 @@ class Camera:
             # transient hiccup. Mark the camera unhealthy so the app can
             # schedule a retry without crashing the rest of the pipeline.
             logger.warning("Camera frame read failed")
-        return ok, frame
+            return ok, frame
+        return ok, self._apply_rotate(frame)
 
     def release(self) -> None:
         """Release hardware resources.  Safe to call multiple times."""
