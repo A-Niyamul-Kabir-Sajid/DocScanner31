@@ -1559,32 +1559,40 @@ class ScanSession:
         # ------------------------------------------------------------------
         # Top status bar
         # ------------------------------------------------------------------
-        page_label = f"{self.page_count()} page{'s' if self.page_count() != 1 else ''}"
-        conf_label = f"conf {detection.confidence:.2f}"
+        page_count = self.page_count()
+        page_label = f"{page_count} page{'s' if page_count != 1 else ''} captured"
+        conf_label = f"page detected — {int(round(detection.confidence * 100))}% sure"
+        # Friendly subtitle that explains what the "scan_mode" value means.
+        mode_phrase = {
+            "color": "color pages",
+            "grayscale": "black & white pages",
+            "bw": "high-contrast pages",
+        }.get(self.scan_mode, self.scan_mode)
         _ui_status_bar(
             canvas,
             title="Smart Document Scanner",
-            subtitle=self.scan_mode,
+            subtitle=f"Saving as {mode_phrase}",
             pills=[
                 ("LIVE", UI_TEXT, UI_SUCCESS),
                 (page_label, UI_TEXT, UI_ACCENT),
-                (self.scan_mode, UI_TEXT, UI_KEY_BG),
+                (f"mode: {self.scan_mode}", UI_TEXT, UI_KEY_BG),
                 (conf_label, UI_TEXT, UI_KEY_BG),
             ],
         )
 
         # ------------------------------------------------------------------
-        # Bottom hotkey rail - leaves room above for thumbs.
+        # Bottom hotkey rail - leaves room above for thumbs.  Labels are
+        # plain English so a first-time user can guess what each key does.
         # ------------------------------------------------------------------
         _ui_hotkey_bar(
             canvas,
             [
-                ("C", "capture", UI_ACCENT),
-                ("D", "finish PDF", UI_SUCCESS),
+                ("C", "capture this page", UI_ACCENT),
+                ("D", "finish & save PDF", UI_SUCCESS),
                 ("X", "delete last page", UI_WARN),
-                ("M", "cycle mode", UI_KEY_BG),
-                ("N", "new document", UI_KEY_BG),
-                ("Q", "quit", UI_ERR),
+                ("M", "switch color / B&W", UI_KEY_BG),
+                ("N", "start a new document", UI_KEY_BG),
+                ("Q", "quit app", UI_ERR),
             ],
             message=self.last_message or None,
             y=h - UI_HOTKEY_BAR_H,
@@ -1597,16 +1605,19 @@ class ScanSession:
             phase = self._auto_capture_phase
             if phase == "cooldown":
                 pill_text = (
-                    f"AUTO | captured p{self.page_count()} | "
-                    f"cooldown {self.auto_capture_cooldown_s:.1f}s"
+                    f"Auto-capture: saved page {self.page_count()}, "
+                    f"next one in {self.auto_capture_cooldown_s:.1f}s"
                 )
                 pill_color, pill_bg = UI_TEXT, UI_SUCCESS
             elif phase == "identifying":
                 c, r = self._auto_capture_progress
-                pill_text = f"AUTO | identifying {c}/{r}"
+                pill_text = (
+                    f"Auto-capture: confirming this page "
+                    f"({c} of {r} frames stable)"
+                )
                 pill_color, pill_bg = UI_TEXT, UI_ACCENT
             elif phase == "idle":
-                pill_text = "AUTO | waiting for document"
+                pill_text = "Auto-capture: on, waiting for a new page"
                 pill_color, pill_bg = UI_TEXT, UI_MUTED
             else:
                 pill_text, pill_bg = "", None
@@ -1616,21 +1627,34 @@ class ScanSession:
 
         # ------------------------------------------------------------------
         # Quality readout just above the hotkey rail (so it's still visible).
-        # yellow when the gate is currently rejecting, green when C will succeed.
+        # Yellow when the gate is currently rejecting, green when C will
+        # succeed, plain grey before we've ever sampled a frame.
         # ------------------------------------------------------------------
         rail_top = h - UI_HOTKEY_BAR_H
         readout_y = min(rail_top - 30, grid_label_bottom(panels, DEBUG_GRID_SCALE) + 20)
         if self.last_quality is not None:
             q = self.last_quality
             qcolor = UI_SUCCESS if q.ok else UI_WARN
-            qtext = (
-                f"quality: {q.reason or 'ok'} "
-                f"(blur={q.blur:.0f} bright={q.brightness:.0f} "
-                f"motion={q.motion:.1f}px)"
-            )
+            if q.ok:
+                qtext = (
+                    f"Quality looks good — press C to save this page "
+                    f"(focus {q.blur:.0f}, brightness {q.brightness:.0f}, "
+                    f"movement {q.motion:.1f}px)"
+                )
+            else:
+                # Strip the "rejected: " / "accepted: " prefix the gate
+                # prepends so the user sees a plain reason instead of a
+                # double verb.
+                reason = (q.reason or "this frame is too blurry to save")
+                prefix = reason.split(":", 1)[-1].strip() if ":" in reason else reason
+                qtext = (
+                    f"Quality: not ready to save — {prefix} "
+                    f"(focus {q.blur:.0f}, brightness {q.brightness:.0f}, "
+                    f"movement {q.motion:.1f}px)"
+                )
         else:
             qcolor = UI_MUTED
-            qtext = "quality: -- (press C to sample)"
+            qtext = "Quality: press C to check this frame"
         _ui_chip(canvas, qtext, 10, readout_y, fg=UI_TEXT, bg=qcolor,
                  scale=0.5, thickness=1, pad=8)
 
@@ -1648,7 +1672,8 @@ class ScanSession:
                 _ui_panel(canvas, tx - 4, ty - 4,
                           thumb.shape[1] + 8, thumb.shape[0] + 8,
                           fill=UI_PANEL, border=UI_SUCCESS, border_thickness=2)
-                _ui_chip(canvas, "would save", tx, ty - 12,
+                _ui_chip(canvas, "Preview — this is what C will save",
+                         tx, ty - 12,
                          fg=UI_TEXT, bg=UI_SUCCESS, scale=0.45, thickness=1, pad=6)
 
         # ------------------------------------------------------------------
@@ -1666,7 +1691,7 @@ class ScanSession:
                 _ui_panel(canvas, lx - 4, ly - 4,
                           last_thumb.shape[1] + 8, last_thumb.shape[0] + 8,
                           fill=UI_PANEL, border=UI_WARN, border_thickness=2)
-                label = f"last page ({self.page_count()}) - [X] deletes"
+                label = f"Page {self.page_count()} saved — press X to undo"
                 _ui_chip(canvas, label, lx, ly - 12,
                          fg=UI_TEXT, bg=UI_WARN, scale=0.45, thickness=1, pad=6)
 
@@ -1698,14 +1723,20 @@ class ScanSession:
 
         src = status.get("source", "?")
         backend = status.get("backend", "?")
-        err = status.get("error") or "no signal"
+        err = status.get("error") or "no signal from the camera"
         retry_in = float(status.get("retry_in") or 0.0)
+
+        # Friendly label for the backend so non-engineers know what it means.
+        backend_phrase = {
+            "opencv": "OpenCV (network / USB camera)",
+            "picamera2": "Raspberry Pi camera module",
+        }.get(backend, backend)
 
         # Top status bar with offline pill.
         _ui_status_bar(
             canvas,
             title="Camera offline",
-            subtitle="retrying to reach the camera…",
+            subtitle="Looking for the camera — the app will keep trying.",
             pills=[
                 ("OFFLINE", UI_TEXT, UI_ERR),
             ],
@@ -1723,7 +1754,7 @@ class ScanSession:
         cy = card_y + 24
 
         # Big banner inside the card.
-        _draw_text(canvas, "! Camera not found", (cx, cy + 30),
+        _draw_text(canvas, "No camera detected", (cx, cy + 30),
                    color=UI_ERR, bg=None, scale=1.0, thickness=2)
         cy += 60
 
@@ -1731,31 +1762,35 @@ class ScanSession:
             nonlocal cy
             _draw_text(canvas, label, (cx, cy + 22),
                        color=UI_MUTED, bg=None, scale=0.55, thickness=1)
-            _draw_text(canvas, str(value), (cx + 140, cy + 22),
+            _draw_text(canvas, str(value), (cx + 200, cy + 22),
                        color=value_color, bg=None, scale=0.55, thickness=1)
             cy += 36
 
-        _row("source", src)
-        _row("backend", backend)
-        _row("reason", err, value_color=UI_WARN)
-        _row("retry in", f"{retry_in:0.1f}s", value_color=UI_ACCENT)
+        _row("Camera URL", src)
+        _row("Stream type", backend_phrase)
+        _row("Why it failed", err, value_color=UI_WARN)
+        _row("Trying again in", f"{retry_in:0.1f} seconds", value_color=UI_ACCENT)
 
         # Tip pinned to the bottom of the card.
         tip_y = card_y + card_h - 50
         cv2.line(canvas, (cx, tip_y - 18), (card_x + card_w - 32, tip_y - 18),
                  UI_BORDER, thickness=1)
-        _draw_text(canvas, "Tip: open DroidCam / IP Webcam, then verify the URL.",
-                   (cx, tip_y + 12),
-                   color=UI_MUTED, bg=None, scale=0.5, thickness=1)
+        _draw_text(
+            canvas,
+            "Tip: open the DroidCam (or IP Webcam) app on your phone, then "
+            "double-check the IP:port number it shows.",
+            (cx, tip_y + 12),
+            color=UI_MUTED, bg=None, scale=0.5, thickness=1,
+        )
 
         # Bottom hotkey rail - only Q to quit makes sense in this state.
         retry_msg = (
-            f"app keeps polling every {CAMERA_RETRY_SECONDS:.0f}s "
-            "until the camera is back"
+            f"The app will keep trying every {CAMERA_RETRY_SECONDS:.0f} "
+            f"seconds until the camera responds."
         )
         _ui_hotkey_bar(
             canvas,
-            [("Q", "quit", UI_ERR)],
+            [("Q", "quit app", UI_ERR)],
             message=retry_msg,
         )
 
@@ -1777,7 +1812,7 @@ class ScanSession:
             )
         except Exception:
             canvas = frame.copy()
-            _draw_text(canvas, "pipeline error - showing raw frame",
+            _draw_text(canvas, "Detection error — showing the raw camera view.",
                        (10, 30), color=UI_ERR, bg=UI_PANEL)
 
         # Bottom strip so the camera frame doesn't bleed under the chrome.
@@ -1788,24 +1823,24 @@ class ScanSession:
         _ui_status_bar(
             canvas,
             title="Smart Document Scanner",
-            subtitle="live preview (fallback)",
+            subtitle="Live preview (simplified view)",
             pills=[
                 ("LIVE", UI_TEXT, UI_SUCCESS),
-                (f"{self.page_count()} page{'s' if self.page_count() != 1 else ''}",
+                (f"{self.page_count()} page{'s' if self.page_count() != 1 else ''} captured",
                  UI_TEXT, UI_ACCENT),
-                (self.scan_mode, UI_TEXT, UI_KEY_BG),
+                (f"mode: {self.scan_mode}", UI_TEXT, UI_KEY_BG),
             ],
         )
 
         _ui_hotkey_bar(
             canvas,
             [
-                ("C", "capture", UI_ACCENT),
-                ("D", "finish PDF", UI_SUCCESS),
+                ("C", "capture this page", UI_ACCENT),
+                ("D", "finish & save PDF", UI_SUCCESS),
                 ("X", "delete last page", UI_WARN),
-                ("M", "cycle mode", UI_KEY_BG),
-                ("N", "new document", UI_KEY_BG),
-                ("Q", "quit", UI_ERR),
+                ("M", "switch color / B&W", UI_KEY_BG),
+                ("N", "start a new document", UI_KEY_BG),
+                ("Q", "quit app", UI_ERR),
             ],
             message=self.last_message or None,
         )
@@ -1822,16 +1857,21 @@ class ScanSession:
         canvas[:] = UI_BG
 
         # Top status bar
-        page_label = "0 pages"
+        page_label = "No pages yet"
         if self.last_pdf_path is not None:
             n_pages = max(self.page_count_for_pdf(self.last_pdf_path), 0)
-            page_label = f"{n_pages} page{'s' if n_pages != 1 else ''}"
+            if n_pages == 0:
+                page_label = "0 pages captured"
+            elif n_pages == 1:
+                page_label = "1 page captured"
+            else:
+                page_label = f"{n_pages} pages captured"
         _ui_status_bar(
             canvas,
             title="Document saved",
-            subtitle="scan the QR or open the URL",
+            subtitle="Scan the QR code or open the link on your phone.",
             pills=[
-                ("PDF_VIEW", UI_TEXT, UI_SUCCESS),
+                ("PDF VIEW", UI_TEXT, UI_SUCCESS),
                 (page_label, UI_TEXT, UI_ACCENT),
             ],
         )
@@ -1840,8 +1880,8 @@ class ScanSession:
         _ui_hotkey_bar(
             canvas,
             [
-                ("N", "new document", UI_ACCENT),
-                ("Q", "quit", UI_ERR),
+                ("N", "start a new document", UI_ACCENT),
+                ("Q", "quit app", UI_ERR),
             ],
             message=self.last_message or None,
             y=h - UI_HOTKEY_BAR_H,
@@ -1855,10 +1895,10 @@ class ScanSession:
                   fill=UI_PANEL_ALT, border=UI_SUCCESS, border_thickness=2)
 
         # Header
-        _draw_text(canvas, "! Document saved",
+        _draw_text(canvas, "Document saved!",
                    (card_x + 24, card_y + 40),
                    color=UI_SUCCESS, scale=0.9, thickness=2)
-        _draw_text(canvas, "scan the QR or open the URL below",
+        _draw_text(canvas, "Scan the QR code or open the link on your phone.",
                    (card_x + 24, card_y + 70),
                    color=UI_MUTED, scale=0.55, thickness=1)
 
@@ -1866,11 +1906,16 @@ class ScanSession:
         row_y = card_y + 110
         if self.last_pdf_path is not None:
             n_pages = max(self.page_count_for_pdf(self.last_pdf_path), 0)
-            _draw_text(canvas, f"PDF: {self.last_pdf_path.name}",
+            _draw_text(canvas, f"File: {self.last_pdf_path.name}",
                        (card_x + 24, row_y),
                        color=UI_TEXT, scale=0.55, thickness=1)
             row_y += 28
-            _draw_text(canvas, f"pages: {n_pages}",
+            page_phrase = (
+                "no pages inside"
+                if n_pages == 0
+                else f"{n_pages} page{'s' if n_pages != 1 else ''} inside"
+            )
+            _draw_text(canvas, f"Pages: {page_phrase}",
                        (card_x + 24, row_y),
                        color=UI_TEXT, scale=0.55, thickness=1)
             row_y += 28
@@ -1878,7 +1923,7 @@ class ScanSession:
             host = self.flask_server.host or self.web_host
             port = self.flask_server.port or self.web_port
             url = f"http://{host}:{port}/{self.last_pdf_path.name}"
-            _draw_text(canvas, f"URL: {url}",
+            _draw_text(canvas, f"Download link: {url}",
                        (card_x + 24, row_y),
                        color=UI_ACCENT, scale=0.55, thickness=1)
 
@@ -1895,7 +1940,7 @@ class ScanSession:
                 _ui_panel(canvas, qx - 6, qy - 6,
                           qr_size + 12, qr_size + 12,
                           fill=UI_PANEL, border=UI_ACCENT, border_thickness=2)
-                _ui_chip(canvas, "scan to download", qx, qy + qr_size + 12,
+                _ui_chip(canvas, "Point your phone here", qx, qy + qr_size + 12,
                          fg=UI_TEXT, bg=UI_ACCENT, scale=0.45, thickness=1, pad=6)
 
         # Divider near the bottom of the card
@@ -1934,27 +1979,33 @@ class ScanSession:
         _ui_panel(canvas, x0, y0, box_w, 6,
                   fill=UI_WARN, border=UI_WARN, border_thickness=0)
 
-        title = "Exit Application?"
         if self.page_count() > 0 and self.last_pdf_path is None:
-            title = "Save current document & Exit?"
+            title = "Save this document and quit?"
+        else:
+            title = "Quit the app?"
 
         _draw_text(canvas, title, (x0 + 28, y0 + 56),
                    color=UI_TEXT, scale=0.9, thickness=2)
 
         if self.page_count() > 0 and self.last_pdf_path is None:
-            subtitle = f"You have {self.page_count()} unsaved page(s)."
+            n = self.page_count()
+            pages_word = "page" if n == 1 else "pages"
+            subtitle = (
+                f"You have {n} {pages_word} that haven't been saved "
+                "as a PDF yet."
+            )
         else:
-            subtitle = "Any unsaved progress will be lost."
+            subtitle = "Anything you haven't saved will be lost."
         _draw_text(canvas, subtitle, (x0 + 28, y0 + 92),
                    color=UI_MUTED, scale=0.55, thickness=1)
 
         # Y / N key chips on the bottom row of the modal.
         chip_y = y0 + box_h - 64
         y_chip_x = x0 + 28
-        n_chip_x = _ui_key_chip(canvas, "Y", "confirm", y_chip_x, chip_y, accent=UI_SUCCESS)
+        n_chip_x = _ui_key_chip(canvas, "Y", "yes, quit", y_chip_x, chip_y, accent=UI_SUCCESS)
         # gap then N chip
-        n_chip_x = max(n_chip_x + 28, y_chip_x + 200)
-        _ui_key_chip(canvas, "N", "cancel", n_chip_x, chip_y, accent=UI_ERR)
+        n_chip_x = max(n_chip_x + 28, y_chip_x + 220)
+        _ui_key_chip(canvas, "N", "no, stay", n_chip_x, chip_y, accent=UI_ERR)
 
     # ------------------------------------------------------------------ #
     @staticmethod
