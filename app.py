@@ -59,8 +59,10 @@ from config import (
     CAMERA_RETRY_SECONDS,
     DEFAULT_AUTO_CAPTURE_COOLDOWN,
     DEFAULT_AUTO_CAPTURE_ENABLED,
+    DEFAULT_AUTOFOCUS,
     DEFAULT_CAMERA_HEIGHT,
     DEFAULT_CAMERA_WIDTH,
+    DEFAULT_LENS_POSITION_DIOPTRES,
     DEFAULT_STABLE_FRAMES,
     DEFAULT_STABILITY_TOLERANCE,
     DEFAULT_WEB_HOST,
@@ -381,9 +383,17 @@ class ScanSession:
     captures_dir: Path = SCANNED_DIR
     output_dir: Path = OUTPUT_DIR
     camera_source: object = 0
-    camera_backend: str = "opencv"
+    # ``"auto"`` (default) - the Camera wrapper picks picamera2 on a Pi and
+    # opencv on a desktop / a network URL.  Use ``--backend opencv`` or
+    # ``--backend picamera2`` on the CLI to override per session.
+    camera_backend: str = "auto"
     camera_width: int = DEFAULT_CAMERA_WIDTH
     camera_height: int = DEFAULT_CAMERA_HEIGHT
+    # Focus knobs.  ``None`` means "use the config default"; an explicit
+    # ``True``/``False`` from the CLI overrides.  Stored on the dataclass so
+    # tests can mutate it without monkey-patching module-level globals.
+    camera_autofocus: Optional[bool] = None
+    camera_lens_position: Optional[float] = None
     web_host: str = DEFAULT_WEB_HOST
     web_port: int = DEFAULT_WEB_PORT
     scan_mode: str = SCAN_MODE
@@ -502,7 +512,13 @@ class ScanSession:
                     width=self.camera_width,
                     height=self.camera_height,
                     backend=self.camera_backend,
+                    autofocus=self.camera_autofocus,
+                    lens_position=self.camera_lens_position,
                 )
+                # The Camera constructor resolves "auto" to a concrete
+                # backend.  Reflect the resolved value back onto the session
+                # so ``camera_status()`` always reports the truth.
+                self.camera_backend = self._camera.backend
             except Exception as exc:  # pragma: no cover - defensive belt
                 # Camera.__init__ no longer raises, but guard the legacy
                 # picamera2 path that still does on missing libs.
@@ -516,6 +532,14 @@ class ScanSession:
                 self._camera._pi_cam = None
                 self._camera.is_open = False
                 self._camera.last_open_error = str(exc)
+                self._camera.autofocus = (
+                    DEFAULT_AUTOFOCUS if self.camera_autofocus is None
+                    else bool(self.camera_autofocus)
+                )
+                self._camera.lens_position = (
+                    DEFAULT_LENS_POSITION_DIOPTRES if self.camera_lens_position is None
+                    else float(self.camera_lens_position)
+                )
         return self._camera
 
     # ------------------------------------------------------------------ #
@@ -561,10 +585,17 @@ class ScanSession:
         retry_in = 0.0
         if not online and self._next_camera_retry_at > 0.0:
             retry_in = max(0.0, self._next_camera_retry_at - time.monotonic())
+        autofocus = bool(getattr(cam, "autofocus", DEFAULT_AUTOFOCUS)) if cam else DEFAULT_AUTOFOCUS
+        lens_position = (
+            float(getattr(cam, "lens_position", DEFAULT_LENS_POSITION_DIOPTRES))
+            if cam else DEFAULT_LENS_POSITION_DIOPTRES
+        )
         return {
             "online": online,
             "source": self.camera_source,
             "backend": self.camera_backend,
+            "autofocus": autofocus,
+            "lens_position": lens_position,
             "error": (cam.last_open_error if cam else "camera not initialised"),
             "retry_in": retry_in,
         }
@@ -1730,6 +1761,7 @@ class ScanSession:
         backend_phrase = {
             "opencv": "OpenCV (network / USB camera)",
             "picamera2": "Raspberry Pi camera module",
+            "auto": "Auto-detect (Pi camera or USB)",
         }.get(backend, backend)
 
         # Top status bar with offline pill.
@@ -2133,7 +2165,38 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
             "http://192.168.1.107:4747/video (DroidCam / IP Webcam)."
         ),
     )
-    p.add_argument("--backend", default="opencv", choices=["opencv", "picamera2"])
+    p.add_argument(
+        "--backend",
+        default="auto",
+        choices=["opencv", "picamera2", "auto"],
+        help=("Camera backend. 'auto' (default) picks picamera2 on a "
+              "Raspberry Pi and opencv elsewhere. URL sources always "
+              "collapse to opencv regardless of this flag."),
+    )
+    p.add_argument(
+        "--autofocus",
+        dest="autofocus",
+        action="store_true",
+        default=None,
+        help=("Enable continuous autofocus on the Pi camera (default: "
+              "fixed focus, see --lens-position).  Ignored on OpenCV / "
+              "phone-stream sources."),
+    )
+    p.add_argument(
+        "--no-autofocus",
+        dest="autofocus",
+        action="store_false",
+        help="Disable continuous autofocus (default).",
+    )
+    p.add_argument(
+        "--lens-position",
+        type=float,
+        default=None,
+        help=("Manual focus distance in dioptres (1/metres) used when "
+              "autofocus is off. 2.2 ≈ 45 cm (typical desk mount); lower "
+              "for a higher stand, higher for a desk-flat scanner. "
+              "Ignored on OpenCV / phone-stream sources."),
+    )
     p.add_argument("--scan-mode", default=SCAN_MODE,
                    choices=["color", "grayscale", "bw"],
                    help="Output style for captured pages (default: %(default)s)")
@@ -2229,6 +2292,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         camera_backend=args.backend,
         camera_width=args.width,
         camera_height=args.height,
+        camera_autofocus=getattr(args, "autofocus", None),
+        camera_lens_position=getattr(args, "lens_position", None),
         web_host=args.host,
         web_port=args.port,
         scan_mode=args.scan_mode,

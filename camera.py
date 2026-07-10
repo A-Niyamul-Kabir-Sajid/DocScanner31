@@ -4,22 +4,44 @@ camera.py
 
 Camera abstraction for the Smart Document Scanner.
 
-Two backends are supported via the ``backend`` argument of ``Camera``:
+Two real backends are supported, plus an ``"auto"`` mode that picks the right
+one for the host platform:
 
-1. ``"opencv"`` (default) — uses ``cv2.VideoCapture``. Works on Windows with
-   DroidCam / IP Webcam and on Linux/Raspberry Pi with a standard UVC USB cam.
-2. ``"picamera2"`` — uses the Raspberry Pi Camera Module 2/3.  Only importable
+1. ``"opencv"`` — uses ``cv2.VideoCapture``. Works on Windows with DroidCam /
+   IP Webcam, and on Linux/Pi with a standard UVC USB cam or a libcamera
+   pipeline that exposes a ``/dev/video*`` node.
+2. ``"picamera2"`` — uses the Raspberry Pi Camera Module via libcamera.
+   Required for native control of focus / exposure / AWB on the Pi Camera
+   Module (including the IMX519 with AK7375 autofocus motor).  Only importable
    on a Pi running libcamera + picamera2.
+3. ``"auto"`` (default) — :func:`detect_raspberry_pi` decides which of the
+   above to use.  Windows / macOS desktop development boxes land on OpenCV;
+   a Pi 4/5 with the V4L2 stack lands on picamera2.  URL sources (DroidCam /
+   IP Webcam) always downgrade to OpenCV regardless of platform.
 
 Keeping the camera behind this thin wrapper means ``app.py`` doesn't need to
-know which hardware is attached.  When porting to the Pi, just construct
-``Camera(backend="picamera2", size=(4608, 2592))`` and the rest of the code
-stays identical.
+know which hardware is attached.  When porting to the Pi, the same code path
+that worked on the dev laptop now picks the IMX519 stack automatically; you
+can still force a backend with ``Camera(backend="opencv", ...)`` or
+``Camera(backend="picamera2", ...)`` for testing.
+
+Focus control
+-------------
+
+For a document scanner fixed focus outperforms continuous autofocus (no focus
+hunting, no blur spikes mid-page).  When ``autofocus=False`` and the picamera2
+backend is active, ``Camera`` issues a single ``set_controls`` call setting
+``AfMode = Manual`` and ``LensPosition = lens_position`` (in dioptres).  The
+AK7375 lens motor on the IMX519 honours this through the Raspberry Pi camera
+stack (the same path you used manually with ``v4l2-ctl --set-ctrl=focus_absolute``).
+On OpenCV the kwargs are accepted but inert — USB webcams and phone-stream
+URLs expose no standard focus control through ``cv2.VideoCapture``.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import socket
 from typing import Optional, Tuple
 from urllib.parse import urlparse
@@ -28,6 +50,112 @@ import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------- #
+# Platform detection
+# --------------------------------------------------------------------------- #
+_RPI_MODEL_PATH = "/proc/device-tree/model"
+# Cached on first call; the answer doesn't change for the lifetime of the
+# process and probing ``/proc/device-tree`` on every Camera(...) instantiation
+# would be wasteful in the LIVE tick.
+_RPI_DETECTED: Optional[bool] = None
+
+
+def detect_raspberry_pi() -> bool:
+    """Return True if we appear to be running on a Raspberry Pi.
+
+    Three signals are checked (any one is enough):
+
+    * ``platform.uname().machine`` reports an aarch64/armv7l kernel — useful
+      on Pi OS Bookworm where /proc/device-tree may be masked by containers.
+    * ``/proc/device-tree/model`` exists and contains the string
+      "Raspberry Pi" (case-insensitive).  This is the canonical check.
+    * ``/dev/v4l-subdev*`` is present, which only happens when libcamera has
+      loaded a sensor driver (IMX219, IMX477, IMX519, ...).
+
+    The function never raises: any OSError / FileNotFoundError is swallowed
+    and treated as "not a Pi" so a missing procfs on a desktop box can't
+    prevent the OpenCV fallback from running.
+    """
+    global _RPI_DETECTED
+    if _RPI_DETECTED is not None:
+        return _RPI_DETECTED
+
+    try:
+        # 1. Kernel architecture heuristic.
+        try:
+            machine = (os.uname().machine or "").lower()
+        except (AttributeError, OSError):
+            machine = ""
+        if machine in {"aarch64", "armv7l", "armv6l"}:
+            logger.info("Raspberry Pi detected via uname.machine=%r", machine)
+            _RPI_DETECTED = True
+            return True
+
+        # 2. Device-tree model string.
+        try:
+            with open(_RPI_MODEL_PATH, "rb") as fh:
+                model_blob = fh.read().decode("utf-8", errors="ignore").lower()
+        except (FileNotFoundError, IsADirectoryError, PermissionError, OSError):
+            model_blob = ""
+        if "raspberry pi" in model_blob:
+            logger.info(
+                "Raspberry Pi detected via %s (%r)",
+                _RPI_MODEL_PATH, model_blob.strip("\x00").strip(),
+            )
+            _RPI_DETECTED = True
+            return True
+
+        # 3. libcamera subdev presence — only Pi camera stacks create these.
+        try:
+            for entry in os.listdir("/dev"):
+                if entry.startswith("v4l-subdev"):
+                    logger.info(
+                        "Raspberry Pi camera stack detected via /dev/%s", entry,
+                    )
+                    _RPI_DETECTED = True
+                    return True
+        except (FileNotFoundError, PermissionError, OSError):
+            pass
+    except Exception:  # pragma: no cover - belt-and-braces
+        logger.exception("Pi detection failed; falling back to OpenCV")
+
+    _RPI_DETECTED = False
+    return False
+
+
+def _looks_like_url(source: object) -> bool:
+    """Heuristic: is ``source`` a network stream rather than a local index?"""
+    if not isinstance(source, str):
+        return False
+    parsed = urlparse(source)
+    return bool(parsed.scheme and parsed.netloc)
+
+
+def select_backend(source: object, requested: str) -> str:
+    """Resolve the ``backend`` argument to one of the real backends.
+
+    * ``"opencv"`` / ``"picamera2"`` are returned verbatim.
+    * ``"auto"`` maps to ``"picamera2"`` on a Pi, ``"opencv"`` elsewhere.
+    * URL sources (DroidCam / IP Webcam) downgrade to OpenCV even when the
+      user explicitly asked for picamera2 — the Pi camera stack cannot serve
+      an HTTP MJPEG feed, and silently failing would mask the real cause.
+    """
+    requested = (requested or "auto").lower()
+    if requested not in {"opencv", "picamera2", "auto"}:
+        logger.warning("Unknown backend %r; falling back to OpenCV", requested)
+        requested = "opencv"
+
+    if _looks_like_url(source) and requested == "picamera2":
+        logger.info(
+            "Camera source %r is a URL; overriding picamera2 -> opencv", source,
+        )
+        return "opencv"
+
+    if requested == "auto":
+        return "picamera2" if detect_raspberry_pi() else "opencv"
+    return requested
 
 
 # --------------------------------------------------------------------------- #
@@ -66,7 +194,18 @@ class Camera:
     width, height : int
         Desired capture resolution.  Note: phone cams may not honor this.
     backend : str
-        ``"opencv"`` (default) or ``"picamera2"`` (Raspberry Pi only).
+        ``"opencv"`` / ``"picamera2"`` / ``"auto"`` (default).
+    autofocus : bool | None
+        When using picamera2: ``True`` requests continuous autofocus,
+        ``False`` switches to manual focus at ``lens_position``, ``None``
+        defers to the global default (``config.DEFAULT_AUTOFOCUS``).  Ignored
+        on the OpenCV backend (USB cams and phone URLs expose no standard
+        focus control through ``cv2.VideoCapture``).
+    lens_position : float | None
+        Manual focus distance in **dioptres** (1/metres).  Only honoured on
+        the picamera2 backend when ``autofocus=False``.  Sensible desk-scan
+        values land between 1.5 (≈65 cm) and 4.0 (≈25 cm); the default of
+        2.2 (≈45 cm) matches a typical over-the-desk scanner mount.
     """
 
     def __init__(
@@ -74,12 +213,30 @@ class Camera:
         source=0,
         width: int = 1280,
         height: int = 720,
-        backend: str = "opencv",
+        backend: str = "auto",
+        autofocus: Optional[bool] = None,
+        lens_position: Optional[float] = None,
     ) -> None:
         self.source = source
         self.width = width
         self.height = height
-        self.backend = backend
+        # Resolve the requested backend to a concrete string.  URLs always
+        # collapse to "opencv"; "auto" picks by platform.
+        self.backend = select_backend(source, backend)
+        self._requested_backend = backend
+        # Focus knobs.  Pull the runtime defaults lazily so tests can patch
+        # ``config.DEFAULT_*`` without importing this module first.
+        try:
+            from config import DEFAULT_AUTOFOCUS, DEFAULT_LENS_POSITION_DIOPTRES
+            self._default_autofocus = DEFAULT_AUTOFOCUS
+            self._default_lens_position = DEFAULT_LENS_POSITION_DIOPTRES
+        except Exception:  # pragma: no cover - config is required at runtime
+            self._default_autofocus = False
+            self._default_lens_position = 2.2
+        self.autofocus = self._default_autofocus if autofocus is None else bool(autofocus)
+        self.lens_position = (
+            self._default_lens_position if lens_position is None else float(lens_position)
+        )
         self._cap: Optional[cv2.VideoCapture] = None
         self._pi_cam = None  # only set when backend == "picamera2"
         # Track the last open attempt so the app layer can poll for recovery.
@@ -87,7 +244,7 @@ class Camera:
         self.is_open: bool = False
         self.last_open_error: Optional[str] = None
 
-        if backend == "picamera2":
+        if self.backend == "picamera2":
             self._open_picamera2()
         else:
             # OpenCV: do NOT raise on failure - the caller (ScanSession)
@@ -207,19 +364,48 @@ class Camera:
         """Open the Raspberry Pi Camera Module via picamera2."""
         try:
             from picamera2 import Picamera2  # type: ignore
+            from libcamera import controls  # type: ignore
         except ImportError as exc:  # pragma: no cover - Pi-only branch
             raise RuntimeError(
                 "picamera2 is not installed. Run 'pip install picamera2' "
                 "on the Raspberry Pi OS (Bookworm or newer)."
             ) from exc
 
-        logger.info("Opening Raspberry Pi camera at %dx%d", self.width, self.height)
+        logger.info(
+            "Opening Raspberry Pi camera at %dx%d (autofocus=%s, "
+            "lens_position=%s dioptres)",
+            self.width, self.height, self.autofocus, self.lens_position,
+        )
         self._pi_cam = Picamera2()
         config = self._pi_cam.create_video_configuration(
             main={"size": (self.width, self.height), "format": "RGB888"}
         )
         self._pi_cam.configure(config)
         self._pi_cam.start()
+
+        # Apply focus controls AFTER start(): libcamera rejects most
+        # ``set_controls`` calls on a configured-but-not-started pipeline.
+        # We *try* the focus controls and only warn on failure so the app
+        # still runs on a fixed-focus camera module (V1/V2/HQ) that doesn't
+        # have an ``AfMode`` enum entry at all.
+        focus_controls = {}
+        if self.autofocus:
+            focus_controls["AfMode"] = controls.AfModeEnum.Continuous
+        else:
+            focus_controls["AfMode"] = controls.AfModeEnum.Manual
+            focus_controls["LensPosition"] = float(self.lens_position)
+        try:
+            self._pi_cam.set_controls(focus_controls)
+            logger.info("Applied picamera2 focus controls: %s", focus_controls)
+        except Exception as exc:  # pragma: no cover - driver-specific
+            # Camera without an autofocus motor (V1, V2, HQ without AF lens)
+            # raises here.  We log and continue so the LIVE overlay still
+            # renders — focus is irrelevant in that case anyway.
+            logger.warning(
+                "Picamera2 focus controls %s rejected by driver: %s. "
+                "Falling back to whatever the sensor defaults to.",
+                focus_controls, exc,
+            )
 
     # ------------------------------------------------------------------ #
     # Frame acquisition

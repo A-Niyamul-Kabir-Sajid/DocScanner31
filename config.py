@@ -32,12 +32,25 @@ TEMPLATES_DIR: Path = PROJECT_ROOT / "templates"
 # --------------------------------------------------------------------------- #
 DEFAULT_CAMERA_WIDTH: int = 1280
 DEFAULT_CAMERA_HEIGHT: int = 720
-DEFAULT_BACKEND: str = "opencv"           # "opencv" | "picamera2"
+# Accepted ``backend`` values:
+#   "opencv"    - ``cv2.VideoCapture`` (USB cams / DroidCam URLs on any OS)
+#   "picamera2" - Raspberry Pi Camera Module via libcamera + picamera2
+#   "auto"      - pick "picamera2" on a Pi, "opencv" everywhere else
+DEFAULT_BACKEND: str = "auto"
 # When the configured camera source is unreachable, the LIVE loop shows a
 # "camera not found" overlay and re-attempts ``Camera.try_reopen()`` every
 # CAMERA_RETRY_SECONDS seconds (the heartbeat tick comes from the same 30 ms
 # render loop). The app stays alive indefinitely until the device comes back.
 CAMERA_RETRY_SECONDS: float = 3.0
+
+# A document scanner benefits more from fixed focus than continuous autofocus:
+# the document sits at a known distance, AF hunting during a multi-page scan
+# produces focus-driven blur frames, and the IMX519 + AK7375 stack on the Pi
+# accepts manual ``LensPosition`` in *dioptres* (1/metres) via libcamera.
+# ``DEFAULT_LENS_POSITION_DIOPTRES = 2.2`` corresponds to ~0.45 m (45 cm),
+# a comfortable desk-to-document distance. Tune per setup via --lens-position.
+DEFAULT_AUTOFOCUS: bool = False
+DEFAULT_LENS_POSITION_DIOPTRES: float = 2.2
 
 # --------------------------------------------------------------------------- #
 # Document scanning pipeline
