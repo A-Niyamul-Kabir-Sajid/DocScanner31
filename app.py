@@ -2319,7 +2319,6 @@ def _coerce_source(value: str) -> object:
 def main(argv: Optional[List[str]] = None) -> int:
     """Console entry point."""
     logging.basicConfig(
-        camera_full_fov=bool(getattr(args, "full_fov", True)),
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s | %(message)s",
     )
@@ -2333,6 +2332,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         camera_autofocus=getattr(args, "autofocus", None),
         camera_lens_position=getattr(args, "lens_position", None),
         camera_rotate=int(getattr(args, "rotate", 0) or 0),
+        camera_full_fov=bool(getattr(args, "full_fov", True)),
         web_host=args.host,
         web_port=args.port,
         scan_mode=args.scan_mode,
