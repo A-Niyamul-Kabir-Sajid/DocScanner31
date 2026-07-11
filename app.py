@@ -394,6 +394,14 @@ class ScanSession:
     # tests can mutate it without monkey-patching module-level globals.
     camera_autofocus: Optional[bool] = None
     camera_lens_position: Optional[float] = None
+    # Pi-camera-only: when True, ``capture_current_frame`` triggers a
+    # single-shot autofocus on each capture (libcamera ``AfMode = Auto``,
+    # poll ``AfStatus`` until locked) so desk-distance scans come out
+    # sharp without running the lens motor continuously.  Off by default
+    # because it adds ~1.5s of latency per shot on the IMX519 AF cycle
+    # and most pages sit at the same distance -- enable with
+    # ``--autofocus-on-capture`` when the doc-to-lens distance varies.
+    autofocus_on_capture: bool = False
     # Rotate captured frames before they leave ``Camera.read()``.  Use this
     # when the camera module is physically mounted in portrait but the
     # sensor still delivers landscape frames, or when you simply want the
@@ -531,6 +539,7 @@ class ScanSession:
                     lens_position=self.camera_lens_position,
                     rotate=self.camera_rotate,
                     full_fov=self.camera_full_fov,
+                    autofocus_on_capture=self.autofocus_on_capture,
                 )
                 # The Camera constructor resolves "auto" to a concrete
                 # backend.  Reflect the resolved value back onto the session
@@ -778,6 +787,21 @@ class ScanSession:
         Returns ``(ok, message, processed_bgr, detection)``.
         """
         if frame is None:
+            # On picamera2 we get a single-shot AF lock right before the
+            # snapshot when ``autofocus_on_capture`` is enabled.  This
+            # block is cheap when the flag is off (returns False in <1ms
+            # on the OpenCV backend and on cameras that already
+            # continuous-AF).
+            try:
+                if self.autofocus_on_capture and getattr(
+                    self.camera, "autofocus_on_capture", False
+                ):
+                    af_locked = self.camera.trigger_autofocus(timeout_s=2.0)
+                    logger.debug(
+                        "autofocus_on_capture: lock=%s", af_locked,
+                    )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("trigger_autofocus raised (ignored): %s", exc)
             ok, frame = self.camera.read()
             if not ok or frame is None:
                 return False, "camera read failed", None, None  # type: ignore[return-value]
@@ -2239,6 +2263,15 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
                    help=("Pi-camera only.  Allow libcamera to crop the sensor "
                          "to the requested aspect ratio (legacy behaviour, "
                          "looks digitally zoomed on a 4:3 sensor)."))
+    p.add_argument("--autofocus-on-capture", dest="autofocus_on_capture",
+                   action="store_true", default=False,
+                   help=("Pi-camera only.  Before each captured frame, kick a "
+                         "single-shot autofocus cycle (libcamera AfMode=Auto) "
+                         "and wait up to 2s for AfStatus=Focused.  Use this "
+                         "when the document-to-lens distance varies between "
+                         "pages; leave it off (default) for fixed-distance "
+                         "desk scans where the extra latency is wasted. "
+                         "Honoured only when --backend picamera2 is active."))
     p.add_argument("--fullscreen", dest="fullscreen", action="store_true",
                    default=False,
                    help=("Open the OpenCV window in fullscreen mode (default: "
@@ -2333,6 +2366,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         camera_lens_position=getattr(args, "lens_position", None),
         camera_rotate=int(getattr(args, "rotate", 0) or 0),
         camera_full_fov=bool(getattr(args, "full_fov", True)),
+        autofocus_on_capture=bool(getattr(args, "autofocus_on_capture", False)),
         web_host=args.host,
         web_port=args.port,
         scan_mode=args.scan_mode,

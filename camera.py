@@ -43,6 +43,7 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import time
 from typing import Optional, Tuple
 from urllib.parse import urlparse
 
@@ -227,6 +228,7 @@ class Camera:
         lens_position: Optional[float] = None,
         rotate: int = 0,
         full_fov: bool = True,
+        autofocus_on_capture: bool = False,
     ) -> None:
         self.source = source
         self.width = width
@@ -269,8 +271,16 @@ class Camera:
         self.lens_position = (
             self._default_lens_position if lens_position is None else float(lens_position)
         )
+        # Single-shot AF trigger before each capture on picamera2.  See
+        # ``trigger_autofocus`` for the lock-poll loop.  Honoured only on
+        # the picamera2 backend; the OpenCV backend treats it as a no-op.
+        self.autofocus_on_capture = bool(autofocus_on_capture)
         self._cap: Optional[cv2.VideoCapture] = None
         self._pi_cam = None  # only set when backend == "picamera2"
+        # ``_af_locked`` / ``_af_in_flight`` track single-shot AF on picamera2
+        # so concurrent capture calls don't issue overlapping triggers.
+        self._af_in_flight: bool = False
+        self._af_locked: Optional[bool] = None
         # Track the last open attempt so the app layer can poll for recovery.
         # ``is_open`` is the canonical "is the camera usable right now?" flag.
         self.is_open: bool = False
@@ -590,6 +600,109 @@ class Camera:
         if self.rotate == 270:
             return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
         return frame
+
+    def trigger_autofocus(self, timeout_s: float = 2.0) -> bool:
+        """Run a single-shot autofocus cycle on picamera2.
+
+        Behaviour
+        ---------
+        * Only honoured when ``self.backend == "picamera2"``.  On the
+          OpenCV backend this method returns ``False`` immediately so
+          callers can call it unconditionally.
+        * Issues ``set_controls({"AfMode": Auto, "AfTrigger": 0})``,
+          which is libcamera's "kick a one-shot AF pass" recipe.
+        * Polls the ``AfStatus`` metadata for up to ``timeout_s``
+          seconds, returning as soon as the driver reports a lock
+          (``AfStatus == 2`` -- Focused) or the timeout elapses.
+        * Re-applies the AF mode the user originally asked for
+          (``Continuous`` or ``Manual``) after the trigger so the LIVE
+          preview returns to its baseline behaviour.
+        * A second concurrent call while one is in flight is a no-op
+          and returns the in-flight result.
+
+        Returns ``True`` if focus locked within ``timeout_s``, else
+        ``False``.  The caller should still proceed with the capture
+        even on ``False`` -- a timed-out AF cycle usually still
+        produces a usable frame, just not guaranteed sharp.
+        """
+        if self.backend != "picamera2":
+            return False
+        if self._pi_cam is None or not self.is_open:
+            return False
+        if self._af_in_flight:
+            # Another thread / call is already polling; piggyback on it.
+            return bool(self._af_locked)
+
+        try:
+            from libcamera import controls as _controls  # type: ignore
+        except Exception:
+            logger.debug("libcamera not importable; skipping trigger_autofocus.")
+            return False
+
+        self._af_in_flight = True
+        self._af_locked = None
+        # Remember the AF mode the user wanted so we can restore it.
+        restore_mode = (
+            _controls.AfModeEnum.Continuous
+            if self.autofocus
+            else _controls.AfModeEnum.Manual
+        )
+        try:
+            self._pi_cam.set_controls({"AfMode": _controls.AfModeEnum.Auto})
+            # libcamera ignores AfTrigger on the IMX519 but it costs nothing
+            # to send it; some firmware revisions honour it.
+            try:
+                self._pi_cam.set_controls({"AfTrigger": 0})
+            except Exception:
+                pass
+
+            deadline = time.monotonic() + max(0.1, float(timeout_s))
+            while time.monotonic() < deadline:
+                # ``capture_metadata`` is non-blocking and returns the
+                # most recent frame's controls dict.
+                meta = {}
+                try:
+                    meta = self._pi_cam.capture_metadata() or {}
+                except Exception as exc:  # pragma: no cover - driver-specific
+                    logger.debug("capture_metadata raised during AF: %s", exc)
+                    break
+                # libcamera returns enum int values; 1=Idle, 2=Focused,
+                # 3=Scanning, 4=Failed. Anything != Focused means we
+                # keep waiting (Scanning) or give up (Failed).
+                status = meta.get("AfStatus")
+                if status == 2:
+                    self._af_locked = True
+                    break
+                if status in (1, 4):
+                    if status == 4:
+                        # Failed - no point spinning the wheel further.
+                        self._af_locked = False
+                        break
+                time.sleep(0.03)
+            else:
+                # Loop exhausted without a lock.
+                self._af_locked = False
+        except Exception as exc:  # pragma: no cover - driver-specific
+            logger.warning("trigger_autofocus failed: %s", exc)
+            self._af_locked = False
+        finally:
+            # Restore the user's preferred AF mode so the LIVE preview
+            # goes back to either continuous-AF or the manual lens
+            # position they configured.
+            try:
+                restore = {"AfMode": restore_mode}
+                if not self.autofocus:
+                    restore["LensPosition"] = float(self.lens_position)
+                self._pi_cam.set_controls(restore)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("Failed to restore AF mode after trigger: %s", exc)
+            self._af_in_flight = False
+
+        logger.debug(
+            "trigger_autofocus finished; locked=%s (timeout=%ss)",
+            self._af_locked, timeout_s,
+        )
+        return bool(self._af_locked)
 
     def read(self) -> Tuple[bool, np.ndarray]:
         """Return ``(ok, frame)`` mirroring ``VideoCapture.read()``.
