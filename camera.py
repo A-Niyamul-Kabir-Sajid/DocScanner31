@@ -443,6 +443,70 @@ class Camera:
     # ------------------------------------------------------------------ #
     # Backend openers
     # ------------------------------------------------------------------ #
+    def _select_picamera2_config(self) -> dict:
+        """Build a ``picamera2`` configuration honouring ``self.full_fov``.
+
+        When ``full_fov=True`` (default) we ask picamera2 to use the
+        **largest** sensor mode the driver exposes, then let libcamera
+        downscale the main stream to the requested ``(width, height)``.
+        This is what ``rpicam-hello --width W --height H`` does internally,
+        and it's the only way to keep the full field of view on a 4:3 sensor
+        when the user asks for a 16:9 output like 1280x720.
+
+        When ``full_fov=False`` we fall back to the legacy behaviour:
+        picamera2 picks a sensor mode whose native aspect ratio already
+        matches the requested output, which crops the sensor (and so
+        zooms in digitally).
+
+        Older picamera2 builds (pre-0.3) don't accept the ``sensor=``
+        kwarg; in that case we degrade gracefully to the default mode
+        selection instead of raising.
+        """
+        main_size = (int(self.width), int(self.height))
+        main_stream = {"size": main_size, "format": "RGB888"}
+
+        if not self.full_fov:
+            return self._pi_cam.create_video_configuration(main=main_stream)
+
+        try:
+            sensor_modes = self._pi_cam.sensor_modes or []
+        except Exception as exc:  # pragma: no cover - driver-specific
+            logger.warning(
+                "picamera2.sensor_modes probe failed (%s); using the "
+                "default mode selection (preview may look zoomed).", exc,
+            )
+            return self._pi_cam.create_video_configuration(main=main_stream)
+
+        if not sensor_modes:
+            return self._pi_cam.create_video_configuration(main=main_stream)
+
+        # Pick the largest output size - that sensor mode uses the entire
+        # pixel array, so the FOV matches the lens's full coverage.
+        largest = max(
+            sensor_modes,
+            key=lambda m: int(m["size"][0]) * int(m["size"][1]),
+        )
+        sensor_output_size = (int(largest["size"][0]), int(largest["size"][1]))
+        logger.info(
+            "Picamera2 full-FOV: forcing sensor mode %s, scaling main "
+            "stream to %dx%d.", sensor_output_size, *main_size,
+        )
+        try:
+            return self._pi_cam.create_video_configuration(
+                main=main_stream,
+                sensor={"output_size": sensor_output_size},
+            )
+        except TypeError:
+            # Pre-0.3 picamera2 doesn't expose ``sensor=``. Fall back; the
+            # user will see the legacy zoomed preview but the app still
+            # runs.
+            logger.warning(
+                "picamera2.create_video_configuration() rejected the "
+                "'sensor' kwarg on this picamera2 version; falling back "
+                "to default mode selection (preview may look zoomed)."
+            )
+            return self._pi_cam.create_video_configuration(main=main_stream)
+
     def _open_picamera2(self) -> None:
         """Open the Raspberry Pi Camera Module via picamera2."""
         try:
@@ -460,30 +524,17 @@ class Camera:
             self.width, self.height, self.autofocus, self.lens_position,
         )
         self._pi_cam = Picamera2()
-        config = self._pi_cam.create_video_configuration(
-            main={"size": (self.width, self.height), "format": "RGB888"}
-        )
+        # ``full_fov=True`` (default) picks the LARGEST sensor mode and lets
+        # libcamera scale the main stream down to (width, height).  This is
+        # what ``rpicam-hello --width W --height H`` does internally, and it
+        # preserves the full sensor field of view.
+        #
+        # Without this, ``create_video_configuration(main={"size": (1280,
+        # 720)})`` on a 4:3 IMX519 selects a 16:9 sensor mode that already
+        # crops the sensor vertically - the resulting preview is visibly
+        # more "zoomed in" than the same resolution via rpicam-hello.
+        config = self._select_picamera2_config()
         self._pi_cam.configure(config)
-        # ``full_fov=True`` (default) asks libcamera to use the entire
-        # sensor area instead of cropping to the configured main-stream
-        # aspect ratio.  Without this the Pi camera delivers a digitally
-        # zoomed preview (e.g. 1280x720 on a 4:3 sensor becomes a 16:9
-        # window inside the sensor) which is exactly the "zoomed in"
-        # behaviour you get from picamera2 but not from
-        # ``rpicam-hello --width 1280 --height 720``.  The latter passes
-        # a ``ScalerCrop`` covering the full sensor, so we mirror that.
-        if self.full_fov:
-            try:
-                self._pi_cam.set_controls({"ScalerCrop": (0, 0, 1, 1)})
-                logger.info(
-                    "Picamera2 ScalerCrop set to full sensor (0,0,1,1) "
-                    "to preserve the natural field of view."
-                )
-            except Exception as exc:  # pragma: no cover - driver-specific
-                logger.warning(
-                    "Picamera2 ScalerCrop=(0,0,1,1) rejected by driver: %s. "
-                    "Falling back to the libcamera-default crop.", exc,
-                )
         self._pi_cam.start()
 
         # Apply focus controls AFTER start(): libcamera rejects most
