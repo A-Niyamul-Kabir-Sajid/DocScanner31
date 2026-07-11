@@ -206,6 +206,15 @@ class Camera:
         the picamera2 backend when ``autofocus=False``.  Sensible desk-scan
         values land between 1.5 (≈65 cm) and 4.0 (≈25 cm); the default of
         2.2 (≈45 cm) matches a typical over-the-desk scanner mount.
+    full_fov : bool
+        Pi-camera-only: when ``True`` (default) the wrapper asks libcamera
+        for the **full sensor area** via ``ScalerCrop = (0, 0, 1, 1)`` so the
+        LIVE preview matches ``rpicam-hello --width W --height H`` instead
+        of being cropped (digitally zoomed) to the requested aspect ratio.
+        Set to ``False`` to recover the old behaviour where picamera2 picks
+        the tightest matching crop.  Ignored on the OpenCV backend; UVC
+        webcams / phone streams don't apply this auto-crop in the first
+        place so the flag is a no-op there.
     """
 
     def __init__(
@@ -217,6 +226,7 @@ class Camera:
         autofocus: Optional[bool] = None,
         lens_position: Optional[float] = None,
         rotate: int = 0,
+        full_fov: bool = True,
     ) -> None:
         self.source = source
         self.width = width
@@ -242,6 +252,10 @@ class Camera:
             )
             rot = 0
         self.rotate = rot
+        # Pi-camera-only: disable libcamera's automatic sensor crop so the
+        # preview shows the same field of view as ``rpicam-hello --width W
+        # --height H``.  OpenCV ignores this flag.
+        self.full_fov = bool(full_fov)
         # Focus knobs.  Pull the runtime defaults lazily so tests can patch
         # ``config.DEFAULT_*`` without importing this module first.
         try:
@@ -450,6 +464,26 @@ class Camera:
             main={"size": (self.width, self.height), "format": "RGB888"}
         )
         self._pi_cam.configure(config)
+        # ``full_fov=True`` (default) asks libcamera to use the entire
+        # sensor area instead of cropping to the configured main-stream
+        # aspect ratio.  Without this the Pi camera delivers a digitally
+        # zoomed preview (e.g. 1280x720 on a 4:3 sensor becomes a 16:9
+        # window inside the sensor) which is exactly the "zoomed in"
+        # behaviour you get from picamera2 but not from
+        # ``rpicam-hello --width 1280 --height 720``.  The latter passes
+        # a ``ScalerCrop`` covering the full sensor, so we mirror that.
+        if self.full_fov:
+            try:
+                self._pi_cam.set_controls({"ScalerCrop": (0, 0, 1, 1)})
+                logger.info(
+                    "Picamera2 ScalerCrop set to full sensor (0,0,1,1) "
+                    "to preserve the natural field of view."
+                )
+            except Exception as exc:  # pragma: no cover - driver-specific
+                logger.warning(
+                    "Picamera2 ScalerCrop=(0,0,1,1) rejected by driver: %s. "
+                    "Falling back to the libcamera-default crop.", exc,
+                )
         self._pi_cam.start()
 
         # Apply focus controls AFTER start(): libcamera rejects most

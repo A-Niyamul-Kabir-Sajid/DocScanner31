@@ -402,6 +402,13 @@ class ScanSession:
     # on both OpenCV and picamera2 backends so the downstream detector /
     # scanner code never has to know which way the sensor was facing.
     camera_rotate: int = 0
+    # Pi-camera-only: when True (default) the Camera wrapper disables
+    # libcamera's auto-crop so the LIVE preview shows the same field of
+    # view as ``rpicam-hello --width W --height H`` instead of being
+    # cropped (digitally zoomed) to the requested main-stream aspect
+    # ratio.  Ignored on the OpenCV backend.  Use --no-full-fov on the
+    # CLI to recover the legacy picamera2 crop behaviour.
+    camera_full_fov: bool = True
     web_host: str = DEFAULT_WEB_HOST
     web_port: int = DEFAULT_WEB_PORT
     scan_mode: str = SCAN_MODE
@@ -523,6 +530,7 @@ class ScanSession:
                     autofocus=self.camera_autofocus,
                     lens_position=self.camera_lens_position,
                     rotate=self.camera_rotate,
+                    full_fov=self.camera_full_fov,
                 )
                 # The Camera constructor resolves "auto" to a concrete
                 # backend.  Reflect the resolved value back onto the session
@@ -2218,6 +2226,19 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
                          "270 to switch a landscape sensor into portrait "
                          "orientation; 0 (default) keeps the sensor as-is. "
                          "Applied on both OpenCV and picamera2 backends."))
+    p.add_argument("--full-fov", dest="full_fov", action="store_true",
+                   default=True,
+                   help=("Pi-camera only.  Use the full sensor area "
+                         "(ScalerCrop=(0,0,1,1)) so the LIVE preview matches "
+                         "``rpicam-hello --width W --height H`` instead of "
+                         "being cropped (digitally zoomed) to the main-stream "
+                         "aspect ratio.  This is the default; pass "
+                         "--no-full-fov to recover the legacy picamera2 "
+                         "auto-crop.  Ignored on OpenCV."))
+    p.add_argument("--no-full-fov", dest="full_fov", action="store_false",
+                   help=("Pi-camera only.  Allow libcamera to crop the sensor "
+                         "to the requested aspect ratio (legacy behaviour, "
+                         "looks digitally zoomed on a 4:3 sensor)."))
     p.add_argument("--fullscreen", dest="fullscreen", action="store_true",
                    default=False,
                    help=("Open the OpenCV window in fullscreen mode (default: "
@@ -2298,6 +2319,7 @@ def _coerce_source(value: str) -> object:
 def main(argv: Optional[List[str]] = None) -> int:
     """Console entry point."""
     logging.basicConfig(
+        camera_full_fov=bool(getattr(args, "full_fov", True)),
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s | %(message)s",
     )
