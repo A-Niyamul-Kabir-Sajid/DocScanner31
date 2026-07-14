@@ -182,6 +182,12 @@ def play_clip(
     if not _ffmpeg_available():
         logger.debug("play_clip: ffmpeg not on PATH; cannot decode %s", filename)
         return False
+    if not sys.platform.startswith("linux"):
+        # Pi-only pipeline.  Emit a one-shot INFO so Windows/macOS users
+        # can see *why* their long-form MP3 cues are silent.
+        logger.info("play_clip: %s skipped (Pi I2S pipeline is Linux-only)",
+                    filename)
+        return False
 
     # Imported lazily so the module loads on Windows / macOS where neither
     # package is installed.
@@ -357,6 +363,7 @@ class MP3Player:
         Anything else is silently ignored (DEBUG-logged).
         """
         if not self.enabled:
+            logger.debug("mp3 play_event(%r): skipped (MP3Player disabled)", name)
             return False
         filename = self._filename_for(name)
         if filename is None:

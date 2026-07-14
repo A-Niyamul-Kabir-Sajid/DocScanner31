@@ -279,12 +279,16 @@ class SoundPlayer:
     def play_event(self, name: str) -> bool:
         """Play the named event's WAV. Returns True if dispatched."""
         if not self.enabled:
+            logger.debug("play_event(%r): skipped (SoundPlayer disabled)", name)
             return False
         wav = self._cache.get(name)
         if wav is None:
             logger.debug("play_event(%r): unknown event, ignoring", name)
             return False
-        return self._play_wav(wav, event_name=name)
+        rc = self._play_wav(wav, event_name=name)
+        logger.info("play_event(%r) -> %s (backend=%s, volume=%.2f)",
+                    name, rc, self._backend_name, self.volume)
+        return rc
 
     # ------------------------------------------------------------------ #
     def _play_wav(self, wav: bytes, *, event_name: Optional[str] = None) -> bool:

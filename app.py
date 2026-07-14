@@ -751,6 +751,7 @@ class ScanSession:
         quality gate.
         """
         if not self.sound_enabled:
+            logger.debug("play_sound(%r): skipped (session.sound_enabled=False)", event)
             return
         try:
             self.sound.play_event(event)
@@ -820,6 +821,7 @@ class ScanSession:
         so the LIVE loop is never stalled or crashed by audio.
         """
         if not self.mp3_enabled:
+            logger.debug("play_mp3(%r): skipped (session.mp3_enabled=False)", event)
             return
         try:
             self.mp3.play_event(event)
