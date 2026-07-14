@@ -1,14 +1,16 @@
 """Audio cues for the Smart Document Scanner.
 
-Three short sound effects are exposed via :func:`play_event`:
+Two short sound effects are exposed via :func:`play_event`:
 
-* ``"detect_start"``  - a soft mid-frequency "blip" when the auto-capture FSM
-  first sees a stable document quad in the current session.
-* ``"detect_stable"`` - a rising two-note chime when 5/5 stable frames have
-  been confirmed and the FSM is about to fire.
-* ``"capture"``       - a satisfying descending three-note "ka-chunk" when a
-  page is committed to the PDF (whether triggered automatically or
-  manually with ``C``).
+* ``"captured"``     - a satisfying descending three-note "ka-chunk" when a
+  page is committed to the PDF (auto-capture fire, manual ``C`` press,
+  or any other successful capture path).
+* ``"page_deleted"`` - a soft "undo" cue when the most recently captured
+  page is dropped via the ``X`` key (or the equivalent UI affordance).
+
+No other events play any sound.  Earlier ``detect_start`` / ``detect_stable``
+chimes have been removed so the audio feedback is limited to user-visible
+state changes only.
 
 Design goals
 ============
@@ -129,14 +131,13 @@ def _build_wav(notes: list, *, sample_rate: int = DEFAULT_SAMPLE_RATE, volume: f
 # --------------------------------------------------------------------------- #
 # Event -> (notes, label) table.
 # Frequencies are chosen to be pleasant and clearly distinguishable.
+# Only two cues ship today: capture success and page deletion.
 # --------------------------------------------------------------------------- #
 _EVENT_NOTES: Dict[str, list] = {
-    # Soft "blip" - just a quad started being visible.
-    "detect_start":  [(660.0, 0.08)],
-    # Two-note rising chime - 5/5 stable confirmed.
-    "detect_stable": [(784.0, 0.10), (988.0, 0.18)],
-    # Three-note "ka-chunk" - capture committed.
-    "capture":       [(880.0, 0.07), (660.0, 0.07), (523.0, 0.14)],
+    # Three-note "ka-chunk" - page successfully captured.
+    "captured":     [(880.0, 0.07), (660.0, 0.07), (523.0, 0.14)],
+    # Soft two-note descending "undo" cue - last page removed.
+    "page_deleted": [(740.0, 0.08), (523.0, 0.14)],
 }
 
 

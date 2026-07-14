@@ -9,9 +9,14 @@ audio device:
 3. ``ScanSession.sound`` is a lazy property.
 4. ``ScanSession.play_sound`` is a defensive wrapper that never raises
    even if the backend does.
-5. The full integration - first-quad chime, auto-fire chime + click, and
-   manual-``C`` click - all dispatch through ``play_sound`` without
-   exploding, even when no real backend is available.
+5. The full integration - auto-fire "captured" chime, manual-``C``
+   "captured" chime, and delete-``X`` "page_deleted" chime - all
+   dispatch through ``play_sound`` without exploding, even when no
+   real backend is available.
+
+Only **two** sound events exist:
+    * ``"captured"``      -> page was committed
+    * ``"page_deleted"``  -> last page was removed
 
 Run it with::
 
@@ -47,6 +52,11 @@ def _check(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+# Only two audio events ship today.  Any reference to a removed event
+# is a regression.
+_KNOWN_SOUND_EVENTS = {"captured", "page_deleted"}
+
+
 def main() -> int:  # noqa: C901 - linear test, fine for a smoke harness
     failures: list = []
 
@@ -70,9 +80,9 @@ def main() -> int:  # noqa: C901 - linear test, fine for a smoke harness
             "sound.get_default_player is exposed",
         )
         _check(
-            {"detect_start", "detect_stable", "capture"}
-            <= set(sound._EVENT_NOTES.keys()),
-            "all three named events are registered",
+            set(sound._EVENT_NOTES.keys()) == _KNOWN_SOUND_EVENTS,
+            f"only the two named events are registered "
+            f"(got {set(sound._EVENT_NOTES.keys())!r})",
         )
         for name, notes in sound._EVENT_NOTES.items():
             _check(
@@ -89,8 +99,9 @@ def main() -> int:  # noqa: C901 - linear test, fine for a smoke harness
         # __init__ time using the in-memory synth path.
         player = SoundPlayer(enabled=False, backend="none")
         _check(
-            set(player._cache.keys()) == {"detect_start", "detect_stable", "capture"},
-            "cache contains all three events",
+            set(player._cache.keys()) == _KNOWN_SOUND_EVENTS,
+            f"cache contains exactly the two events "
+            f"(got {set(player._cache.keys())!r})",
         )
         for name, blob in player._cache.items():
             _check(isinstance(blob, (bytes, bytearray)) and len(blob) > 44,
@@ -120,13 +131,13 @@ def main() -> int:  # noqa: C901 - linear test, fine for a smoke harness
         player._backend_name = "none"
         player._backend = None
         # Capture WAV size to ensure cache is not silently cleared.
-        for name in ("detect_start", "detect_stable", "capture"):
+        for name in _KNOWN_SOUND_EVENTS:
             rc = player.play_event(name)
             _check(rc is False, f"play_event({name!r}) -> False on no backend")
         # Disabled explicitly must short-circuit BEFORE touching the backend.
         disabled = SoundPlayer(enabled=False, backend="winsound")
         _check(disabled.enabled is False, "enabled=False sticks")
-        for name in ("detect_start", "detect_stable", "capture"):
+        for name in _KNOWN_SOUND_EVENTS:
             rc = disabled.play_event(name)
             _check(rc is False, f"disabled.play_event({name!r}) -> False")
 
@@ -147,9 +158,9 @@ def main() -> int:  # noqa: C901 - linear test, fine for a smoke harness
     def p5_configure_rebuilds() -> None:
         from sound import SoundPlayer
         player = SoundPlayer(enabled=True, backend="none")
-        before = player._cache["capture"]
+        before = player._cache["captured"]
         player.configure(volume=0.2)
-        after = player._cache["capture"]
+        after = player._cache["captured"]
         _check(before != after, "configure(volume) rebuilds the WAV cache")
         _check(player.volume == 0.2, "configure(volume=0.2) sticks")
         player.configure(enabled=False)
@@ -172,14 +183,15 @@ def main() -> int:  # noqa: C901 - linear test, fine for a smoke harness
         _check(isinstance(player, object), "s.sound returns a SoundPlayer-like object")
         _check(
             set(player._cache.keys())
-            == {"detect_start", "detect_stable", "capture"},
-            "session SoundPlayer has all three events",
+            == _KNOWN_SOUND_EVENTS,
+            f"session SoundPlayer has the two events "
+            f"(got {set(player._cache.keys())!r})",
         )
         # Calling .sound twice must return the same instance (lazy memo).
         _check(s.sound is player, "s.sound is memoised")
         # play_sound on a disabled session must short-circuit cleanly.
         s.sound_enabled = False
-        for name in ("detect_start", "detect_stable", "capture", "nonsense"):
+        for name in (*_KNOWN_SOUND_EVENTS, "nonsense"):
             try:
                 s.play_sound(name)
             except Exception as exc:
@@ -193,8 +205,9 @@ def main() -> int:  # noqa: C901 - linear test, fine for a smoke harness
     # ------------------------------------------------------------------ #
     def p7_fsm_sound_hooks() -> None:
         """Drive ``_maybe_auto_capture`` with stubbed camera + processor and
-        assert that every sound hook the user asked for fires through the
-        FSM transitions without the LIVE loop ever needing to spin up."""
+        assert that the only sound events the user hears are ``"captured"``
+        (auto-fire + manual C) and ``"page_deleted"`` (X).  No other
+        sound should ever fire, regardless of FSM phase."""
         import numpy as np
         from app import ScanSession
 
@@ -251,12 +264,11 @@ def main() -> int:  # noqa: C901 - linear test, fine for a smoke harness
         s.auto_capture_tolerance_px = 50.0
         s._auto_capture = None
 
-        # First call: quad visible, streak building (0/3 -> 1/3). No fire.
+        # First call: quad visible, streak building (0/3 -> 1/3). No fire,
+        # and the only sounds we ship today must not have fired yet.
         s._maybe_auto_capture()
-        _check("detect_start" in events_fired,
-               "first quad fires detect_start")
-        _check("detect_stable" not in events_fired,
-               "no detect_stable yet (streak < required)")
+        _check(events_fired == [],
+               f"S1_seeking is silent (got {events_fired})")
 
         # Force streak == required_frames + clear cooldown timestamp so
         # should_capture() returns True on the next tick.
@@ -264,20 +276,16 @@ def main() -> int:  # noqa: C901 - linear test, fine for a smoke harness
         controller.tracker.stable_count = s.auto_capture_stable_frames
         controller.last_capture_timestamp = 0.0
         s._maybe_auto_capture()
-        _check("detect_stable" in events_fired,
-               "auto-fire transitions identifying->cooldown: detect_stable fires")
-        _check("capture" in events_fired,
-               "auto-fire commits: capture cue fires too")
+        _check(events_fired == ["captured"],
+               f"auto-fire fires exactly ['captured'] (got {events_fired})")
 
-        # After fire we are in cooldown - detect_start must NOT fire again
-        # (the per-session flag is still True, but we shouldn't re-chime).
+        # In cooldown: no extra sound should ever fire.
         before = list(events_fired)
         s._maybe_auto_capture()
         _check(events_fired == before,
-               "in cooldown: no extra sound events are fired")
+               f"cooldown is silent (got {events_fired})")
 
-        # Quad disappears: the flag should re-arm so the next visible
-        # quad gets a fresh blip.
+        # Quad disappears: must NOT fire any sound either.
         class _NoDocDetector:
             corners = None
             confidence = 0.0
@@ -289,9 +297,12 @@ def main() -> int:  # noqa: C901 - linear test, fine for a smoke harness
         # Wait out the cooldown so we leave the cooldown branch.
         import time as _t
         _t.sleep(s.auto_capture_cooldown_s + 0.05)
+        before = list(events_fired)
         s._maybe_auto_capture()
+        _check(events_fired == before,
+               f"doc-disappeared is silent (got {events_fired})")
         _check(s._sound_detect_start_played is False,
-               "doc-disappeared re-arms the detect_start chime")
+               "doc-disappeared re-arms the legacy _sound_detect_start_played flag")
 
         # --- 7b: manual C path -------------------------------------- #
         events_fired.clear()
@@ -307,10 +318,10 @@ def main() -> int:  # noqa: C901 - linear test, fine for a smoke harness
             _StubDetector(),
         )
         s2._handle_live_key("c")
-        _check(events_fired == ["capture"],
-               f"manual C fires 'capture' exactly once (got {events_fired})")
+        _check(events_fired == ["captured"],
+               f"manual C fires 'captured' exactly once (got {events_fired})")
 
-        # --- 7c: quality-gate rejection must NOT fire 'capture' ------ #
+        # --- 7c: quality-gate rejection must NOT fire 'captured' ----- #
         events_fired.clear()
         s3 = ScanSession(
             camera_source="http://127.0.0.1:1/video",
@@ -325,13 +336,35 @@ def main() -> int:  # noqa: C901 - linear test, fine for a smoke harness
         _check(events_fired == [],
                f"rejected capture fires no sound (got {events_fired})")
 
-    # ------------------------------------------------------------------ #
-    phases = [
-        p1_imports, p2_wav_blobs, p3_disabled_noop, p4_unknown_event,
-        p5_configure_rebuilds, p6_session_wiring, p7_fsm_sound_hooks,
-    ]
-    for p in phases:
-        _phase(p.__name__, p)
+        # --- 7d: delete-last-page path ------------------------------ #
+        events_fired.clear()
+        s4 = ScanSession(
+            camera_source="http://127.0.0.1:1/video",
+            web_port=18085,
+        )
+        s4.sound_enabled = True
+        s4._sound = _StubSound()  # type: ignore[assignment]
+        # Pre-seed one captured page so delete_last_page has work to do.
+        # We bypass the real filesystem by monkey-patching ``pages`` to
+        # a non-empty list and ``delete_last_page`` to return True.
+        s4.delete_last_page = lambda: True  # type: ignore[assignment]
+        s4._handle_live_key("x")
+        _check(events_fired == ["page_deleted"],
+               f"delete X fires 'page_deleted' exactly once "
+               f"(got {events_fired})")
+
+        # --- 7e: X with no pages must NOT fire 'page_deleted' ------- #
+        events_fired.clear()
+        s5 = ScanSession(
+            camera_source="http://127.0.0.1:1/video",
+            web_port=18086,
+        )
+        s5.sound_enabled = True
+        s5._sound = _StubSound()  # type: ignore[assignment]
+        s5.delete_last_page = lambda: False  # type: ignore[assignment]
+        s5._handle_live_key("x")
+        _check(events_fired == [],
+               f"X with no pages fires no sound (got {events_fired})")
 
     # ------------------------------------------------------------------ #
     # Phase 8 - voice layer (offline TTS) module-level shape.

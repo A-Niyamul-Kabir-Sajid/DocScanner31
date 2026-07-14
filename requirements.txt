@@ -30,3 +30,13 @@ imagehash>=4.3.1
 # Optional — only needed when migrating to Raspberry Pi 5 + Camera Module 3
 # ---------------------------------------------------------------------------
 # picamera2>=0.3.12
+
+# ---------------------------------------------------------------------------
+# Optional — only needed on the Raspberry Pi 5 + MAX98357A I2S amp deployment
+# to play the long-form ``captured.mp3`` / ``deleted.mp3`` cues.  Without
+# these the ``mp3_player`` module silently no-ops, so the dev box keeps
+# working fine without them installed.
+# ---------------------------------------------------------------------------
+# pydub>=0.25.1
+# pyalsaaudio>=0.11.0
+# ffmpeg (system package: ``sudo apt install -y ffmpeg``)

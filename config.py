@@ -153,6 +153,21 @@ DEFAULT_VOICE_RATE_WPM: int = 165       # speaking rate (pyttsx3 honours it; esp
 DEFAULT_VOICE_BACKEND: str = "auto"     # "pyttsx3" | "espeak" | "auto"
 
 # --------------------------------------------------------------------------- #
+# Long-form MP3 cues (Raspberry Pi 5 + MAX98357A I2S amp deployment).
+#
+# The ``mp3_player`` module plays user-supplied ``captured.mp3`` /
+# ``deleted.mp3`` clips directly on the Pi 5's hardware I2S amp via
+# ``pydub`` + ``pyalsaaudio`` (no PulseAudio / PipeWire in the path).
+# On Windows / macOS / any host without pydub+alsaaudio+ffmpeg the
+# player is a silent no-op so the dev box keeps working.
+# --------------------------------------------------------------------------- #
+DEFAULT_MP3_ENABLED: bool = True
+DEFAULT_MP3_DEVICE: str = "plughw:2,0"   # MAX98357A card 2, device 0
+DEFAULT_MP3_VOLUME_DB: float = 8.0       # +8 dB software gain (no hw mixer)
+DEFAULT_MP3_CAPTURED_FILE: str = "captured.mp3"
+DEFAULT_MP3_DELETED_FILE: str = "deleted.mp3"
+
+# --------------------------------------------------------------------------- #
 # Auto page-change detection
 # --------------------------------------------------------------------------- #
 # When enabled, ``PageChangeDetector`` watches the live pipeline for a
@@ -210,6 +225,11 @@ DEFAULT_VOICE_RATE_WPM = DEFAULT_VOICE_RATE_WPM
 DEFAULT_VOICE_BACKEND = DEFAULT_VOICE_BACKEND
 PDF_DEFAULT_NAME = "scan.pdf"
 PDF_PREFIX = "scan_"
+DEFAULT_MP3_ENABLED = DEFAULT_MP3_ENABLED  # noqa: PLW0127
+DEFAULT_MP3_DEVICE = DEFAULT_MP3_DEVICE  # noqa: PLW0127
+DEFAULT_MP3_VOLUME_DB = DEFAULT_MP3_VOLUME_DB  # noqa: PLW0127
+DEFAULT_MP3_CAPTURED_FILE = DEFAULT_MP3_CAPTURED_FILE  # noqa: PLW0127
+DEFAULT_MP3_DELETED_FILE = DEFAULT_MP3_DELETED_FILE  # noqa: PLW0127
 
 # --------------------------------------------------------------------------- #
 # Runtime dataclass (overridable for tests)
@@ -246,6 +266,11 @@ class AppConfig:
     voice_language: str = DEFAULT_VOICE_LANGUAGE
     voice_rate_wpm: int = DEFAULT_VOICE_RATE_WPM
     voice_backend: str = DEFAULT_VOICE_BACKEND
+    mp3_enabled: bool = DEFAULT_MP3_ENABLED
+    mp3_device: str = DEFAULT_MP3_DEVICE
+    mp3_volume_db: float = DEFAULT_MP3_VOLUME_DB
+    mp3_captured_file: str = DEFAULT_MP3_CAPTURED_FILE
+    mp3_deleted_file: str = DEFAULT_MP3_DELETED_FILE
     extra: dict = field(default_factory=dict)
 
 

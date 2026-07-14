@@ -91,6 +91,49 @@ screen is shown in the footer hint text.
 
 3. To run headless (no OpenCV window), comment out the `cv2.imshow` block in `app.py` and rely solely on the web UI. The Pi is often used without a display.
 
+## Audio cues (Pi 5 + MAX98357A I2S amp)
+
+When the scanner runs on the Pi 5 with the optional MAX98357A mono amplifier
+and a 5 W speaker, two layers of audio feedback are active:
+
+- **Tone cues** (`sound.py`) — short synthesized WAV blips on capture / delete.
+- **Spoken prompts** (`voice.py`) — TTS phrases via `espeak-ng`.
+- **Long-form MP3 cues** (`mp3_player.py`) — user-supplied clips played
+  directly on the I2S amp via `pydub` + `pyalsaaudio`.  Drop `captured.mp3`
+  and `deleted.mp3` into the project root and they fire on the matching
+  lifecycle event.
+
+### Enabling the I2S amp
+
+Add `dtoverlay=max98357a` to `/boot/firmware/config.txt` and reboot.  The
+amplifier registers as card 2, device 0 (`plughw:2,0`).
+
+### Installing the Pi-side dependencies
+
+```bash
+sudo apt update
+sudo apt install -y ffmpeg                     # MP3 decoding (pydub shells out to it)
+pip3 install pydub pyalsaaudio                 # Python audio pipeline
+```
+
+Drop your clips into the project root:
+
+```
+DocumentScanner/
+├── captured.mp3    # plays on a successful page capture (manual C, auto, etc.)
+└── deleted.mp3     # plays when the last page is removed via X
+```
+
+CLI overrides: `--mp3 / --no-mp3`, `--mp3-captured <path>`,
+`--mp3-deleted <path>`, `--mp3-device plughw:2,0`, `--mp3-volume 8.0`.
+
+The pipeline is the one we proved out manually:
+
+```
+MP3 -> ffmpeg (decode) -> pydub (mono, 48 kHz, S16_LE, +8 dB) ->
+pyalsaaudio (plughw:2,0, 32768-byte chunks) -> MAX98357A -> speaker
+```
+
 ## Generating the PDF and QR
 
 From the web UI, click **Build PDF** to render `output/scan.pdf`. Click **Build QR**, enter a URL (e.g. the local server address printed by the app), and a `qrcode.png` is written into `output/`.

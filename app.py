@@ -101,6 +101,21 @@ except ImportError:  # pragma: no cover - config is required at runtime
     DEFAULT_VOICE_LANGUAGE = "en"
     DEFAULT_VOICE_RATE_WPM = 165
     DEFAULT_VOICE_BACKEND = "auto"
+from mp3_player import MP3Player
+try:
+    from config import (
+        DEFAULT_MP3_CAPTURED_FILE,
+        DEFAULT_MP3_DELETED_FILE,
+        DEFAULT_MP3_DEVICE,
+        DEFAULT_MP3_ENABLED,
+        DEFAULT_MP3_VOLUME_DB,
+    )
+except ImportError:  # pragma: no cover - config is required at runtime
+    DEFAULT_MP3_ENABLED = True
+    DEFAULT_MP3_DEVICE = "plughw:2,0"
+    DEFAULT_MP3_VOLUME_DB = 8.0
+    DEFAULT_MP3_CAPTURED_FILE = "captured.mp3"
+    DEFAULT_MP3_DELETED_FILE = "deleted.mp3"
 from image_grid import stack_images
 from page_change_detector import PageChangeDetector, PageChangeEvent
 from pdf_builder import PDFBuilder, document_filename
@@ -500,6 +515,15 @@ class ScanSession:
     voice_rate_wpm: int = DEFAULT_VOICE_RATE_WPM
     voice_backend: str = DEFAULT_VOICE_BACKEND
     _voice: Optional[VoicePrompter] = field(default=None, init=False)
+
+    # Long-form MP3 cues (Raspberry Pi 5 + MAX98357A I2S amp).  Same
+    # lazy / monkey-patchable contract as ``_sound`` / ``_voice`` above.
+    mp3_enabled: bool = DEFAULT_MP3_ENABLED
+    mp3_device: str = DEFAULT_MP3_DEVICE
+    mp3_volume_db: float = DEFAULT_MP3_VOLUME_DB
+    mp3_captured_file: str = DEFAULT_MP3_CAPTURED_FILE
+    mp3_deleted_file: str = DEFAULT_MP3_DELETED_FILE
+    _mp3: Optional[MP3Player] = field(default=None, init=False)
     # Internal book-keeping for the HUD pill.
     _auto_capture: Optional[AutoCaptureController] = field(default=None, init=False)
     _auto_capture_phase: str = field(default="off", init=False)
@@ -749,6 +773,44 @@ class ScanSession:
             self.voice.speak(event, **fmt)
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("speak(%r) failed: %s", event, exc)
+
+    @property
+    def mp3(self) -> MP3Player:
+        """Lazy accessor for the long-form MP3 cue player.
+
+        Constructed on first access so tests can replace ``_mp3`` without
+        triggering ``__post_init__`` (mirrors :attr:`sound` / :attr:`voice`).
+        On non-Linux hosts the underlying backend is a silent no-op, so this
+        property is safe to access from any platform.
+        """
+        if self._mp3 is None:
+            self._mp3 = MP3Player(
+                enabled=self.mp3_enabled,
+                captured_file=self.mp3_captured_file,
+                deleted_file=self.mp3_deleted_file,
+                device=self.mp3_device,
+                volume_db=self.mp3_volume_db,
+            )
+        return self._mp3
+
+    def play_mp3(self, event: str) -> None:
+        """Safe wrapper around :meth:`MP3Player.play_event`.
+
+        Recognised events match the project-root clip filenames:
+
+        * ``"captured"``     - plays ``captured.mp3``.
+        * ``"page_deleted"`` - plays ``deleted.mp3``.
+
+        Never raises.  All exceptions (missing pydub, missing ffmpeg,
+        refused ALSA device, file-not-found) are logged at DEBUG level
+        so the LIVE loop is never stalled or crashed by audio.
+        """
+        if not self.mp3_enabled:
+            return
+        try:
+            self.mp3.play_event(event)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("play_mp3(%r) failed: %s", event, exc)
 
     # ------------------------------------------------------------------ #
     # Public FSM API
@@ -1097,11 +1159,10 @@ class ScanSession:
         if result.phase == "off":
             return
 
-        # Document left the frame: re-arm the per-session "detect_start"
-        # chime flag so the next visible quad triggers a fresh blip.
-        # This was the legacy behaviour pre-FSM and is asserted by
-        # smoke_sound.p7_fsm_sound_hooks ("doc-disappeared re-arms the
-        # detect_start chime").
+        # Document left the frame: re-arm the per-session capture
+        # chime flag so the next visible quad can trigger a fresh
+        # sound when a page is actually captured.  Kept as a flag
+        # (legacy hook for smoke_sound) but no longer plays audio.
         if quad is None:
             self._sound_detect_start_played = False
 
@@ -1122,11 +1183,12 @@ class ScanSession:
             int(result.progress[0]), int(result.progress[1])
         )
 
-        # State 1 -- building streak.  Play "detected" once per session.
+        # State 1 -- building streak.  No audio cue here anymore;
+        # the only sound is played when a page is actually captured
+        # (see ``_fire_auto_capture`` and the manual-capture path).
         if result.phase == "S1_seeking":
             if quad is not None and not self._sound_detect_start_played:
                 self._sound_detect_start_played = True
-                self.play_sound("detect_start")
                 self.speak("detected")
             self.last_message = (
                 f"AUTO | S1 seeking {result.progress[0]}/{result.progress[1]}"
@@ -1187,10 +1249,9 @@ class ScanSession:
                 "auto-captured page %d (no-match timeout %.1fs)",
                 self.page_count(), self.auto_capture.s2_no_match_timeout_s,
             )
-            # Audio cues -- the user just heard state-1 say "ready";
-            # now play the capture click + verbal confirmation.
-            self.play_sound("detect_stable")
-            self.play_sound("capture")
+            # Audio cues -- play the single capture chime plus the
+            # verbal confirmation.
+            self.play_sound("captured")
             self.speak("stable")
             self.speak("capture_auto")
         else:
@@ -1500,7 +1561,10 @@ class ScanSession:
                     controller.tracker.required_frames,
                 )
                 # Audio cue - same "ka-chunk" as an auto-capture fire.
-                self.play_sound("capture")
+                self.play_sound("captured")
+                # Pi 5 deployment: also play the user-supplied
+                # ``captured.mp3`` clip on the MAX98357A I2S amp.
+                self.play_mp3("captured")
                 self.speak("capture_manual")
             else:
                 self.speak("capture_rejected", reason=msg)
@@ -1512,11 +1576,9 @@ class ScanSession:
             saved = self.finish_pdf()
             if saved is not None:
                 self.last_message = f"finished -> {saved.name}"
-                # Audible save cue: a short rising chime paired with the
-                # spoken "Document saved, N pages" so the user always
-                # hears confirmation even if the TTS is interrupted by
-                # the previous capture ka-chunk.
-                self.play_sound("detect_stable")
+                # No extra sound here -- the user already heard
+                # "captured" on every page; the spoken
+                # "Document saved, N pages" is the only confirmation.
                 self.speak("document_saved", n=self.page_count())
             else:
                 self.speak("capture_rejected", reason=msg)
@@ -1529,7 +1591,10 @@ class ScanSession:
             if self.delete_last_page():
                 # Soft "undo" cue so the user hears confirmation even if
                 # they're not looking at the HUD.
-                self.play_sound("capture_rejected")
+                self.play_sound("page_deleted")
+                # Pi 5 deployment: also play the user-supplied
+                # ``deleted.mp3`` clip on the MAX98357A I2S amp.
+                self.play_mp3("page_deleted")
                 self.speak("page_deleted")
             else:
                 self.last_message = "no pages to delete"
@@ -2337,6 +2402,27 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
                          "en-us, de, fr.  Ignored on Windows by most SAPI5 voices."))
     p.add_argument("--voice-rate", type=int, default=None,
                    help=("Speaking rate in words per minute (default: 165)."))
+    p.add_argument("--mp3", dest="mp3", action="store_true",
+                   default=None,
+                   help=("Enable long-form MP3 cues (default: enabled). "
+                         "Plays captured.mp3 / deleted.mp3 on the Pi 5 "
+                         "MAX98357A I2S amp."))
+    p.add_argument("--no-mp3", dest="mp3", action="store_false",
+                   default=None,
+                   help="Disable long-form MP3 cues (--mp3 / --no-mp3).")
+    p.add_argument("--mp3-device", type=str, default=None,
+                   help=("ALSA device for MP3 cues "
+                         "(default: plughw:2,0 = MAX98357A I2S amp)."))
+    p.add_argument("--mp3-volume", type=float, default=None,
+                   help=("Software gain in dB applied to MP3 cues before "
+                         "write (default: +8.0).  Increase for louder "
+                         "playback; the MAX98357A has no hw mixer."))
+    p.add_argument("--mp3-captured", type=str, default=None,
+                   help=("Path to the MP3 played on a successful page "
+                         "capture (default: <project_root>/captured.mp3)."))
+    p.add_argument("--mp3-deleted", type=str, default=None,
+                   help=("Path to the MP3 played on page deletion "
+                         "(default: <project_root>/deleted.mp3)."))
     return p.parse_args(argv)
 
 
@@ -2437,6 +2523,30 @@ def main(argv: Optional[List[str]] = None) -> int:
     logger.info(
         "Voice: enabled=%s language=%s rate=%d wpm",
         session.voice_enabled, session.voice_language, session.voice_rate_wpm,
+    )
+
+    # MP3 cue CLI overrides -------------------------------------------------
+    if getattr(args, "mp3", None) is True:
+        session.mp3_enabled = True
+    elif getattr(args, "mp3", None) is False:
+        session.mp3_enabled = False
+    if getattr(args, "mp3_device", None) is not None:
+        session.mp3_device = str(args.mp3_device)
+        # Force re-build so the new device string is honoured.
+        session._mp3 = None
+    if getattr(args, "mp3_volume", None) is not None:
+        session.mp3_volume_db = float(args.mp3_volume)
+        session._mp3 = None
+    if getattr(args, "mp3_captured", None) is not None:
+        session.mp3_captured_file = str(args.mp3_captured)
+        session._mp3 = None
+    if getattr(args, "mp3_deleted", None) is not None:
+        session.mp3_deleted_file = str(args.mp3_deleted)
+        session._mp3 = None
+    logger.info(
+        "MP3: enabled=%s device=%s volume=%+0.1f dB captured=%s deleted=%s",
+        session.mp3_enabled, session.mp3_device, session.mp3_volume_db,
+        session.mp3_captured_file, session.mp3_deleted_file,
     )
 
     logger.info(
