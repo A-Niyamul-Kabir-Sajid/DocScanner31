@@ -642,15 +642,17 @@ class Camera:
         if self._pi_cam is None:
             return
         target = float(self.lens_position)
+        attempts = int(getattr(self, "_FOCUS_SETTLE_ATTEMPTS", 4))
+        delay_s = float(getattr(self, "_FOCUS_SETTLE_DELAY_S", 0.30))
         try:
-            for attempt in range(_FOCUS_SETTLE_ATTEMPTS):
+            for attempt in range(attempts):
                 # Give the actuator wall time to actually move before we
                 # sample metadata.  Without this sleep we read metadata
                 # from a frame whose exposure started before
                 # ``set_controls`` returned, which still reports the
                 # previous position even when the driver DID accept the
                 # new value.
-                time.sleep(_FOCUS_SETTLE_DELAY_S)
+                time.sleep(delay_s)
                 req = self._pi_cam.capture_request()
                 try:
                     meta = req.get_metadata()
@@ -667,7 +669,7 @@ class Camera:
                     "LensPosition request was %.2f dpt but driver reports "
                     "%.2f dpt (attempt %d/%d) - re-applying.",
                     target, actual if actual is not None else float("nan"),
-                    attempt + 1, _FOCUS_SETTLE_ATTEMPTS,
+                    attempt + 1, attempts,
                 )
                 self._pi_cam.set_controls(
                     {
@@ -681,7 +683,10 @@ class Camera:
         # Last resort: kick a one-shot AF pass so the actuator wakes up,
         # then re-issue our Manual value.  Without this, a camera that
         # booted up in an unknown focus state will sit at infinity
-        # forever.
+        # forever.  We then run the same settle-and-verify loop we used
+        # above, because the metadata-read race means a single
+        # ``capture_request`` straight after ``set_controls`` will echo
+        # the OLD position and look like the lens didn't move.
         try:
             logger.info("Falling back to AfMode=Auto one-shot to wake the "
                         "lens actuator, then re-applying Manual %.2f.",
@@ -696,23 +701,42 @@ class Camera:
                     req.release()
                 if meta.get("AfStatus") in (2, 3):  # Focused / Cannot focus
                     break
-                import time as _t
-                _t.sleep(0.05)
+                time.sleep(0.05)
             self._pi_cam.set_controls(
                 {
                     "AfMode": controls.AfModeEnum.Manual,
                     "LensPosition": target,
                 }
             )
-            req = self._pi_cam.capture_request()
-            try:
-                meta = req.get_metadata() or {}
-            finally:
-                req.release()
-            actual = meta.get("LensPosition")
-            logger.info(
-                "After Auto-wake: requested %.2f dpt, driver reports %.2f.",
-                target, actual if actual is not None else float("nan"),
+            # Run the same settle loop after the Auto-wake so we don't
+            # log "driver reports 1.00" when the actuator just hadn't
+            # finished moving yet.
+            for post_attempt in range(attempts):
+                time.sleep(delay_s)
+                req = self._pi_cam.capture_request()
+                try:
+                    meta = req.get_metadata() or {}
+                finally:
+                    req.release()
+                actual = meta.get("LensPosition")
+                if actual is not None and abs(float(actual) - target) < 0.05:
+                    logger.info(
+                        "After Auto-wake: lens confirmed at %.2f dpt "
+                        "(post-wake attempt %d/%d).",
+                        float(actual), post_attempt + 1, attempts,
+                    )
+                    return
+                logger.warning(
+                    "After Auto-wake: requested %.2f dpt, driver reports "
+                    "%.2f (post-wake attempt %d/%d).",
+                    target, actual if actual is not None else float("nan"),
+                    post_attempt + 1, attempts,
+                )
+            logger.error(
+                "Auto-wake fallback could not confirm %.2f dpt after %d "
+                "settle attempts - the lens actuator may not be present "
+                "(fixed-focus module?) or is wedged.",
+                target, attempts,
             )
         except Exception as exc:  # pragma: no cover - driver-specific
             logger.warning("Auto-wake fallback raised: %s", exc)
