@@ -1675,6 +1675,12 @@ class ScanSession:
         is ``Continuous``.  We always force the mode to ``Manual`` on nudge
         so the user gets instant feedback; the original ``self.autofocus``
         preference is preserved on the instance for the HUD / next session.
+
+        The actual ``set_controls`` + verify-and-retry loop is delegated to
+        ``Camera.set_manual_focus`` so runtime nudges get the same race
+        protection (``_settle_manual_focus``) as the startup path -- the
+        IMX519 + AK7375 actuator has a "first frame is a no-op" race that
+        bites hotkey nudges just as hard as ``--lens-position``.
         """
         cam = getattr(self, "_camera", None)
         if cam is None or not cam.is_open:
@@ -1688,34 +1694,34 @@ class ScanSession:
         # Clamp into the IMX519's safe range so we never request infinity
         # or a value that the driver rounds back to zero.
         new_value = max(FOCUS_LENS_MIN_DPT, min(FOCUS_LENS_MAX_DPT, new_value))
-        cam.lens_position = new_value
+
+        # Delegate the actual driver call + verify-and-retry to
+        # ``Camera.set_manual_focus`` so hotkeys and ``--lens-position``
+        # share the same race-resistant code path.
+        applied = cam.set_manual_focus(new_value)
         cam.autofocus = False  # nudge means "lock here, manual"
-
-        # Try the libcamera import inline -- the rest of the app lazily
-        # imports libcamera only when picamera2 is the backend.
-        try:
-            from libcamera import controls as _controls  # type: ignore
-        except Exception as exc:  # pragma: no cover - libcamera not present
-            self.last_message = f"libcamera not available: {exc}"
-            return
-
-        try:
-            cam._pi_cam.set_controls(
-                {
-                    "AfMode": _controls.AfModeEnum.Manual,
-                    "LensPosition": float(new_value),
-                }
-            )
-        except Exception as exc:  # pragma: no cover - driver-specific
-            self.last_message = f"focus set failed: {exc}"
-            return
 
         # LensPosition is in dioptres (1/m).  Show a friendly cm estimate.
         cm = 100.0 / max(0.1, new_value)
-        self.last_message = (
-            f"focus -> {new_value:.2f} dpt  (≈{cm:0.0f} cm)  "
-            f"step {delta_dpt:+.2f}"
-        )
+        if applied != applied:  # NaN check without importing math
+            self.last_message = (
+                f"focus -> {new_value:.2f} dpt  (≈{cm:0.0f} cm)  "
+                f"step {delta_dpt:+.2f} -- driver didn't report back"
+            )
+        elif abs(applied - new_value) > 0.05:
+            # Driver reported back a different value than we asked for.
+            # On the IMX519 this means the actuator is stale or the
+            # module is fixed-focus; either way the lens didn't move to
+            # what we wanted.
+            self.last_message = (
+                f"focus -> {new_value:.2f} dpt (driver reports "
+                f"{applied:.2f})  step {delta_dpt:+.2f}"
+            )
+        else:
+            self.last_message = (
+                f"focus -> {new_value:.2f} dpt  (≈{cm:0.0f} cm)  "
+                f"step {delta_dpt:+.2f}"
+            )
 
     def trigger_focus_lock(self) -> None:
         """Kick a one-shot AF cycle (``AfMode=Auto``) on the picamera2
@@ -1747,7 +1753,17 @@ class ScanSession:
             )
 
     def _focus_status_label(self) -> str:
-        """Human-readable focus mode + lens position for the HUD pill."""
+        """Human-readable focus mode + lens position for the HUD pill.
+
+        We distinguish "what we asked for" (``cam.lens_position``) from
+        "what the driver reports in metadata" (``cam.get_applied_lens_position``).
+        On a fixed-focus module or a stale IMX519 actuator these two can
+        disagree, and showing only the requested value masks the
+        "lens didn't actually move" case the user is trying to debug.
+        Sampling the metadata on every render is a bit pricey (~30 ms of
+        capture_request wall time) but the HUD only redraws at ~30 fps
+        anyway, so the cost is hidden.
+        """
         cam = getattr(self, "_camera", None)
         if cam is None or not cam.is_open:
             return "focus: —"
@@ -1760,11 +1776,26 @@ class ScanSession:
         if cam.autofocus:
             return "focus: continuous AF"
         try:
-            dpt = float(cam.lens_position)
-            cm = 100.0 / max(0.1, dpt)
-            return f"focus: manual {dpt:.2f} dpt (≈{cm:0.0f} cm)"
+            requested = float(cam.lens_position)
         except Exception:  # pragma: no cover - defensive
             return "focus: manual"
+        applied = cam.get_applied_lens_position()
+        cm_req = 100.0 / max(0.1, requested)
+        if applied != applied:  # NaN: driver didn't report LensPosition
+            return (
+                f"focus: manual {requested:.2f} dpt (≈{cm_req:0.0f} cm) "
+                f"[no driver feedback]"
+            )
+        if abs(applied - requested) > 0.05:
+            # Driver disagrees with what we asked for -- classic symptom
+            # of a fixed-focus module or a wedged actuator.
+            cm_app = 100.0 / max(0.1, applied)
+            return (
+                f"focus: manual {requested:.2f} dpt "
+                f"(driver: {applied:.2f}, ≈{cm_app:0.0f} cm)"
+            )
+        cm = 100.0 / max(0.1, applied)
+        return f"focus: manual {applied:.2f} dpt (≈{cm:0.0f} cm)"
 
     # ------------------------------------------------------------------ #
     # Rendering

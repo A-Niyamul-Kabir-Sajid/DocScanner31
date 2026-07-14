@@ -520,28 +520,137 @@ class Camera:
     # ------------------------------------------------------------------ #
     # Focus-application hardening for the IMX519 + AK7375 stack
     # ------------------------------------------------------------------ #
+    # When ``set_controls(AfMode=Manual, LensPosition=X)`` lands, the next
+    # frame that the sensor exposes reflects the new lens position.  On
+    # the IMX519 running ~30 fps that's roughly 200-400 ms wall time
+    # before ``capture_request().get_metadata()["LensPosition"]`` reports
+    # X.  Reading metadata sooner gives you the *previous* position even
+    # when the driver did accept the new value, which looks like a stuck
+    # lens to the caller.  These two knobs tune the wait/retry policy.
+    _FOCUS_SETTLE_DELAY_S = 0.30
+    _FOCUS_SETTLE_ATTEMPTS = 4
+
+    def set_manual_focus(self, dioptres: float) -> float:
+        """Apply a new manual ``LensPosition`` and verify it stuck.
+
+        Public entry point used by runtime focus hotkeys (``[``/``]``/``{``/``}``)
+        so they get the same race protection as the startup path.  Returns
+        the value the driver reports in metadata after the settle loop,
+        or ``float('nan')`` if the camera isn't open / has no picamera2
+        handle.  The caller can compare against the requested value to
+        surface "the motor didn't move" in the HUD.
+        """
+        if self._pi_cam is None:
+            return float("nan")
+        try:
+            from libcamera import controls as _controls  # type: ignore
+        except Exception:
+            return float("nan")
+        target = float(dioptres)
+        self.lens_position = target
+        self.autofocus = False
+        try:
+            self._pi_cam.set_controls(
+                {
+                    "AfMode": _controls.AfModeEnum.Manual,
+                    "LensPosition": target,
+                }
+            )
+        except Exception as exc:  # pragma: no cover - driver-specific
+            logger.warning("Manual focus set_controls raised: %s", exc)
+            return float("nan")
+        # Reuse the same settle/retry/auto-wake logic as startup so
+        # runtime nudges behave identically to ``--lens-position``.
+        try:
+            self._settle_manual_focus(_controls)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("set_manual_focus settle raised: %s", exc)
+        # Sample the metadata once more so the caller can show
+        # "applied=2.70 dpt" in the HUD.  We sleep the same settle delay
+        # so the frame we sample was exposed *after* the final retry.
+        time.sleep(self._FOCUS_SETTLE_DELAY_S)
+        try:
+            req = self._pi_cam.capture_request()
+            try:
+                meta = req.get_metadata() or {}
+            finally:
+                req.release()
+            actual = meta.get("LensPosition")
+        except Exception:  # pragma: no cover - driver-specific
+            return float("nan")
+        if actual is None:
+            return float("nan")
+        try:
+            return float(actual)
+        except (TypeError, ValueError):
+            return float("nan")
+
+    def get_applied_lens_position(self) -> float:
+        """Return the last ``LensPosition`` the driver reported in metadata.
+
+        Distinct from ``self.lens_position`` (which is the value WE stored):
+        on a fixed-focus module ``self.lens_position`` will be 2.7 even
+        though the driver happily echoes back whatever you wrote without
+        moving the lens.  This helper returns ``float('nan')`` when the
+        camera isn't open or the metadata doesn't carry the field.
+        """
+        if self._pi_cam is None:
+            return float("nan")
+        try:
+            req = self._pi_cam.capture_request()
+            try:
+                meta = req.get_metadata() or {}
+            finally:
+                req.release()
+            actual = meta.get("LensPosition")
+        except Exception:  # pragma: no cover - driver-specific
+            return float("nan")
+        if actual is None:
+            return float("nan")
+        try:
+            return float(actual)
+        except (TypeError, ValueError):
+            return float("nan")
+
     def _settle_manual_focus(self, controls) -> None:
         """Re-apply ``LensPosition`` until the driver actually accepts it.
 
         The IMX519 + AK7375 autofocus actuator on Raspberry Pi OS Bookworm
-        has a well-known first-frame race: the very first
-        ``set_controls(AfMode=Manual, LensPosition=...)`` call after
-        ``Picamera2.start()`` returns success but the actuator never
-        receives the command, and the lens stays at the module's
-        power-on default (typically infinity / far).  Subsequent calls
-        work fine.
+        has two well-known races we have to work around:
 
-        We capture a request, read the metadata, and compare the reported
-        ``LensPosition`` against what we asked for.  If the driver hasn't
-        moved the lens we re-issue the controls (up to 3 times) and, as a
-        last resort, kick a one-shot ``AfMode=Auto`` cycle so libcamera
-        talks to the actuator at least once before we re-apply Manual.
+        1. First-frame race: the very first
+           ``set_controls(AfMode=Manual, LensPosition=...)`` call after
+           ``Picamera2.start()`` returns success but the I²C command to the
+           actuator never lands - the lens stays at the module's power-on
+           default (typically infinity / far).
+
+        2. Metadata-read race: ``capture_request().get_metadata()["LensPosition"]``
+           reflects the controls stamped on a frame that was *already in
+           flight* when we called ``set_controls``.  We have to wait at
+           least one exposure (~200 ms on the IMX519 at 30 fps) before the
+           next frame's metadata reports the new position.  Reading
+           metadata immediately gives you back the OLD value, which is
+           exactly the wrong signal for "did the lens move?".
+
+        We re-issue controls up to ``FOCUS_SETTLE_ATTEMPTS`` times, sleeping
+        ``FOCUS_SETTLE_DELAY_S`` seconds between each issuance so the next
+        captured frame is exposed under the new controls.  If verification
+        still fails we fall back to a one-shot ``AfMode=Auto`` cycle so
+        libcamera talks to the actuator at least once before we re-apply
+        Manual.
         """
         if self._pi_cam is None:
             return
         target = float(self.lens_position)
         try:
-            for attempt in range(3):
+            for attempt in range(_FOCUS_SETTLE_ATTEMPTS):
+                # Give the actuator wall time to actually move before we
+                # sample metadata.  Without this sleep we read metadata
+                # from a frame whose exposure started before
+                # ``set_controls`` returned, which still reports the
+                # previous position even when the driver DID accept the
+                # new value.
+                time.sleep(_FOCUS_SETTLE_DELAY_S)
                 req = self._pi_cam.capture_request()
                 try:
                     meta = req.get_metadata()
@@ -556,9 +665,9 @@ class Camera:
                     return
                 logger.warning(
                     "LensPosition request was %.2f dpt but driver reports "
-                    "%.2f dpt (attempt %d/3) - re-applying.",
+                    "%.2f dpt (attempt %d/%d) - re-applying.",
                     target, actual if actual is not None else float("nan"),
-                    attempt + 1,
+                    attempt + 1, _FOCUS_SETTLE_ATTEMPTS,
                 )
                 self._pi_cam.set_controls(
                     {
