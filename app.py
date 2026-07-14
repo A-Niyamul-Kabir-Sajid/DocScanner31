@@ -80,6 +80,20 @@ from config import (
     WINDOW_TITLE,
 )
 from auto_capture_controller import AutoCaptureController, S1_SEEKING_STABLE, S2_WAITING_FOR_CHANGE
+
+# ---------------------------------------------------------------------------
+# Focus tuning (manual focus hotkeys + one-shot AF)
+# ---------------------------------------------------------------------------
+# libcamera's IMX519 driver reports a valid LensPosition in [0.0, ~10.0]
+# dioptres (1/metres).  Values >= 10.0 either saturate or error out.  2.2
+# dpt == ~45 cm, the default desk-to-doc distance.  We keep a hard ceiling
+# at 10.0 so a runaway hotkey can't take the lens out of range.
+FOCUS_LENS_MIN_DPT = 0.5     # ~2.0 m  (far wall)
+FOCUS_LENS_MAX_DPT = 10.0    # ~0.1 m  (close-up)
+FOCUS_LENS_STEP_DPT = 0.1    # +/- per [, ] keypress
+FOCUS_FINE_STEP_DPT = 0.05   # shift-[ / shift-] (smaller nudge)
+# One-shot AF timeout for the [F] hotkey -- matches Camera.trigger_autofocus.
+FOCUS_LOCK_TIMEOUT_S = 2.0
 from document_processor import DetectionResult, DocumentProcessor
 from flask_server import FlaskServer
 from sound import SoundPlayer
@@ -1613,6 +1627,27 @@ class ScanSession:
             self.last_message = f"scan mode -> {self.scan_mode}"
             return
 
+        # -------------------------------------------------------------- #
+        # Focus controls (manual focus / one-shot AF)
+        # -------------------------------------------------------------- #
+        # ``[`` / ``]`` nudge the manual lens position by ±FOCUS_LENS_STEP_DPT
+        # (0.1 dpt).  Holding shift halves the step for fine adjustment.
+        # We do not require AF to be off -- switching to manual mode on
+        # nudge is the whole point of having a "lock focus here" key.
+        if ch in ("[", "]", "{", "}"):
+            shift = ch in ("{", "}")
+            step = FOCUS_FINE_STEP_DPT if shift else FOCUS_LENS_STEP_DPT
+            direction = 1.0 if ch in ("]", "}") else -1.0
+            self.nudge_focus(direction * step)
+            return
+
+        # ``F`` triggers a single-shot autofocus cycle (libcamera AfMode=Auto)
+        # and re-applies the user's preferred mode afterwards.  Works in
+        # both manual and continuous-AF modes.
+        if ch in ("f", "F"):
+            self.trigger_focus_lock()
+            return
+
     # ------------------------------------------------------------------ #
     def _handle_pdf_view_key(self, ch: str) -> None:
         if ch == "n":
@@ -1626,6 +1661,110 @@ class ScanSession:
         if ch in ("c", "d"):
             self.last_message = "press N for a new document"
             return
+
+    # ------------------------------------------------------------------ #
+    # Focus helpers (used by the [, ] / F hotkeys)
+    # ------------------------------------------------------------------ #
+    def nudge_focus(self, delta_dpt: float) -> None:
+        """Bump ``self.camera.lens_position`` by ``delta_dpt`` dioptres and
+        immediately re-apply it as a libcamera control.
+
+        Switching the camera to ``AfMode=Manual`` and setting ``LensPosition``
+        is the only way to actually move the lens on the IMX519 stack from
+        Python -- libcamera ignores writes to the property bag if the mode
+        is ``Continuous``.  We always force the mode to ``Manual`` on nudge
+        so the user gets instant feedback; the original ``self.autofocus``
+        preference is preserved on the instance for the HUD / next session.
+        """
+        cam = getattr(self, "_camera", None)
+        if cam is None or not cam.is_open:
+            self.last_message = "camera not open yet"
+            return
+        if cam.backend != "picamera2":
+            self.last_message = "manual focus only on --backend picamera2"
+            return
+
+        new_value = float(cam.lens_position) + float(delta_dpt)
+        # Clamp into the IMX519's safe range so we never request infinity
+        # or a value that the driver rounds back to zero.
+        new_value = max(FOCUS_LENS_MIN_DPT, min(FOCUS_LENS_MAX_DPT, new_value))
+        cam.lens_position = new_value
+        cam.autofocus = False  # nudge means "lock here, manual"
+
+        # Try the libcamera import inline -- the rest of the app lazily
+        # imports libcamera only when picamera2 is the backend.
+        try:
+            from libcamera import controls as _controls  # type: ignore
+        except Exception as exc:  # pragma: no cover - libcamera not present
+            self.last_message = f"libcamera not available: {exc}"
+            return
+
+        try:
+            cam._pi_cam.set_controls(
+                {
+                    "AfMode": _controls.AfModeEnum.Manual,
+                    "LensPosition": float(new_value),
+                }
+            )
+        except Exception as exc:  # pragma: no cover - driver-specific
+            self.last_message = f"focus set failed: {exc}"
+            return
+
+        # LensPosition is in dioptres (1/m).  Show a friendly cm estimate.
+        cm = 100.0 / max(0.1, new_value)
+        self.last_message = (
+            f"focus -> {new_value:.2f} dpt  (≈{cm:0.0f} cm)  "
+            f"step {delta_dpt:+.2f}"
+        )
+
+    def trigger_focus_lock(self) -> None:
+        """Kick a one-shot AF cycle (``AfMode=Auto``) on the picamera2
+        backend, then re-apply the user's preferred mode.
+
+        This is the [F] hotkey -- gives you a single auto-focus pass for
+        the current scene without leaving continuous-AF on permanently.
+        """
+        cam = getattr(self, "_camera", None)
+        if cam is None or not cam.is_open:
+            self.last_message = "camera not open yet"
+            return
+        if cam.backend != "picamera2":
+            self.last_message = "autofocus only on --backend picamera2"
+            return
+        # ``Camera.trigger_autofocus`` polls AfStatus for up to
+        # FOCUS_LOCK_TIMEOUT_S and then restores the user's AF mode.
+        self.last_message = "focusing... (one-shot AF)"
+        locked = bool(cam.trigger_autofocus(timeout_s=FOCUS_LOCK_TIMEOUT_S))
+        # Update the last_message AFTER the call so the user sees a result.
+        # We can't read AfStatus from the post-call AfMode, but the
+        # trigger_autofocus() logger shows it; the user can press F again
+        # if it didn't lock.
+        if locked:
+            self.last_message = "focus locked (one-shot AF complete)"
+        else:
+            self.last_message = (
+                "focus didn't lock in time -- nudged default; try F again"
+            )
+
+    def _focus_status_label(self) -> str:
+        """Human-readable focus mode + lens position for the HUD pill."""
+        cam = getattr(self, "_camera", None)
+        if cam is None or not cam.is_open:
+            return "focus: —"
+        if cam.backend != "picamera2":
+            # OpenCV / network streams -- focus is handled by the device.
+            return "focus: auto (device)"
+        # On picamera2 the truth is the live ``self.autofocus`` flag, which
+        # ``nudge_focus`` flips to False so the HUD reflects what the
+        # lens is actually doing.
+        if cam.autofocus:
+            return "focus: continuous AF"
+        try:
+            dpt = float(cam.lens_position)
+            cm = 100.0 / max(0.1, dpt)
+            return f"focus: manual {dpt:.2f} dpt (≈{cm:0.0f} cm)"
+        except Exception:  # pragma: no cover - defensive
+            return "focus: manual"
 
     # ------------------------------------------------------------------ #
     # Rendering
@@ -1715,6 +1854,7 @@ class ScanSession:
                 (page_label, UI_TEXT, UI_ACCENT),
                 (f"mode: {self.scan_mode}", UI_TEXT, UI_KEY_BG),
                 (conf_label, UI_TEXT, UI_KEY_BG),
+                (self._focus_status_label(), UI_TEXT, UI_KEY_BG),
             ],
         )
 
@@ -1729,6 +1869,8 @@ class ScanSession:
                 ("D", "finish & save PDF", UI_SUCCESS),
                 ("X", "delete last page", UI_WARN),
                 ("M", "switch color / B&W", UI_KEY_BG),
+                ("[ ]", "focus nearer / farther", UI_KEY_BG),
+                ("F", "one-shot autofocus", UI_KEY_BG),
                 ("N", "start a new document", UI_KEY_BG),
                 ("Q", "quit app", UI_ERR),
             ],
