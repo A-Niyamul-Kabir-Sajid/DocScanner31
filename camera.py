@@ -517,6 +517,97 @@ class Camera:
             )
             return self._pi_cam.create_video_configuration(main=main_stream)
 
+    # ------------------------------------------------------------------ #
+    # Focus-application hardening for the IMX519 + AK7375 stack
+    # ------------------------------------------------------------------ #
+    def _settle_manual_focus(self, controls) -> None:
+        """Re-apply ``LensPosition`` until the driver actually accepts it.
+
+        The IMX519 + AK7375 autofocus actuator on Raspberry Pi OS Bookworm
+        has a well-known first-frame race: the very first
+        ``set_controls(AfMode=Manual, LensPosition=...)`` call after
+        ``Picamera2.start()`` returns success but the actuator never
+        receives the command, and the lens stays at the module's
+        power-on default (typically infinity / far).  Subsequent calls
+        work fine.
+
+        We capture a request, read the metadata, and compare the reported
+        ``LensPosition`` against what we asked for.  If the driver hasn't
+        moved the lens we re-issue the controls (up to 3 times) and, as a
+        last resort, kick a one-shot ``AfMode=Auto`` cycle so libcamera
+        talks to the actuator at least once before we re-apply Manual.
+        """
+        if self._pi_cam is None:
+            return
+        target = float(self.lens_position)
+        try:
+            for attempt in range(3):
+                req = self._pi_cam.capture_request()
+                try:
+                    meta = req.get_metadata()
+                finally:
+                    req.release()
+                actual = meta.get("LensPosition") if meta else None
+                if actual is not None and abs(float(actual) - target) < 0.05:
+                    logger.info(
+                        "LensPosition confirmed at %.2f dpt on attempt %d.",
+                        float(actual), attempt + 1,
+                    )
+                    return
+                logger.warning(
+                    "LensPosition request was %.2f dpt but driver reports "
+                    "%.2f dpt (attempt %d/3) - re-applying.",
+                    target, actual if actual is not None else float("nan"),
+                    attempt + 1,
+                )
+                self._pi_cam.set_controls(
+                    {
+                        "AfMode": controls.AfModeEnum.Manual,
+                        "LensPosition": target,
+                    }
+                )
+        except Exception as exc:  # pragma: no cover - driver-specific
+            logger.warning("LensPosition verification raised: %s", exc)
+
+        # Last resort: kick a one-shot AF pass so the actuator wakes up,
+        # then re-issue our Manual value.  Without this, a camera that
+        # booted up in an unknown focus state will sit at infinity
+        # forever.
+        try:
+            logger.info("Falling back to AfMode=Auto one-shot to wake the "
+                        "lens actuator, then re-applying Manual %.2f.",
+                        target)
+            self._pi_cam.set_controls({"AfMode": controls.AfModeEnum.Auto})
+            # Wait for the auto pass to finish (poll metadata briefly).
+            for _ in range(20):
+                req = self._pi_cam.capture_request()
+                try:
+                    meta = req.get_metadata() or {}
+                finally:
+                    req.release()
+                if meta.get("AfStatus") in (2, 3):  # Focused / Cannot focus
+                    break
+                import time as _t
+                _t.sleep(0.05)
+            self._pi_cam.set_controls(
+                {
+                    "AfMode": controls.AfModeEnum.Manual,
+                    "LensPosition": target,
+                }
+            )
+            req = self._pi_cam.capture_request()
+            try:
+                meta = req.get_metadata() or {}
+            finally:
+                req.release()
+            actual = meta.get("LensPosition")
+            logger.info(
+                "After Auto-wake: requested %.2f dpt, driver reports %.2f.",
+                target, actual if actual is not None else float("nan"),
+            )
+        except Exception as exc:  # pragma: no cover - driver-specific
+            logger.warning("Auto-wake fallback raised: %s", exc)
+
     def _open_picamera2(self) -> None:
         """Open the Raspberry Pi Camera Module via picamera2."""
         try:
@@ -570,6 +661,20 @@ class Camera:
                 "Falling back to whatever the sensor defaults to.",
                 focus_controls, exc,
             )
+
+        # Verify the lens actually moved.  On the IMX519 + AK7375 stack the
+        # very first ``set_controls`` after ``start()`` is frequently a
+        # no-op: the lens actuator needs a frame to wake up, and libcamera
+        # silently clamps ``LensPosition`` to the previous value rather
+        # than raising.  We capture a request, read back the metadata, and
+        # if the driver didn't honour our value we re-issue the controls
+        # (still no luck → switch to ``AfMode=Auto`` so libcamera kicks the
+        # actuator at least once before we re-apply Manual).
+        if not self.autofocus:
+            try:
+                self._settle_manual_focus(controls)
+            except Exception as exc:  # pragma: no cover - driver-specific
+                logger.warning("Manual-focus settle raised: %s", exc)
         # Mark the pipeline as live.  Without this the LIVE loop spins
         # forever in the "camera not found" overlay because ``read()``
         # never had a reason to flip ``is_open``.  A freshly-started
