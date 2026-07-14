@@ -130,6 +130,10 @@ DEFAULT_AUTO_CAPTURE_COOLDOWN: float = 3.0  # 3 s no-match window in State 2 bef
 DEFAULT_SOUND_ENABLED: bool = True
 DEFAULT_SOUND_VOLUME: float = 0.6  # 0.0 (silent) - 1.0 (full)
 DEFAULT_SOUND_SAMPLE_RATE: int = 22050
+# ALSA I2S backend - same MAX98357A card as the long-form MP3 pipeline.
+# ``plughw:2,0`` is the overlay card 2, device 0 on the Pi 5.
+DEFAULT_SOUND_ALSA_DEVICE: str = "plughw:2,0"
+DEFAULT_SOUND_ALSA_CHUNK_BYTES: int = 4096
 # ~2 s of stable corners at the 30 ms LIVE tick (33 fps * 2 s ~= 66 frames).
 # User requested a 2-second stability window before auto-capture fires.
 DEFAULT_STABLE_FRAMES: int = 10  # ~2 s at the 30 ms LIVE tick
@@ -219,6 +223,8 @@ DEFAULT_AUTO_CAPTURE_COOLDOWN = DEFAULT_AUTO_CAPTURE_COOLDOWN
 DEFAULT_SOUND_ENABLED = DEFAULT_SOUND_ENABLED
 DEFAULT_SOUND_VOLUME = DEFAULT_SOUND_VOLUME
 DEFAULT_SOUND_SAMPLE_RATE = DEFAULT_SOUND_SAMPLE_RATE
+DEFAULT_SOUND_ALSA_DEVICE = DEFAULT_SOUND_ALSA_DEVICE
+DEFAULT_SOUND_ALSA_CHUNK_BYTES = DEFAULT_SOUND_ALSA_CHUNK_BYTES
 DEFAULT_VOICE_ENABLED = DEFAULT_VOICE_ENABLED
 DEFAULT_VOICE_LANGUAGE = DEFAULT_VOICE_LANGUAGE
 DEFAULT_VOICE_RATE_WPM = DEFAULT_VOICE_RATE_WPM
@@ -266,6 +272,8 @@ class AppConfig:
     voice_language: str = DEFAULT_VOICE_LANGUAGE
     voice_rate_wpm: int = DEFAULT_VOICE_RATE_WPM
     voice_backend: str = DEFAULT_VOICE_BACKEND
+    sound_alsa_device: str = DEFAULT_SOUND_ALSA_DEVICE
+    sound_alsa_chunk_bytes: int = DEFAULT_SOUND_ALSA_CHUNK_BYTES
     mp3_enabled: bool = DEFAULT_MP3_ENABLED
     mp3_device: str = DEFAULT_MP3_DEVICE
     mp3_volume_db: float = DEFAULT_MP3_VOLUME_DB

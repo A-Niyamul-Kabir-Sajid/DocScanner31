@@ -98,10 +98,17 @@ from document_processor import DetectionResult, DocumentProcessor
 from flask_server import FlaskServer
 from sound import SoundPlayer
 try:
-    from config import DEFAULT_SOUND_ENABLED, DEFAULT_SOUND_VOLUME
+    from config import (
+        DEFAULT_SOUND_ALSA_CHUNK_BYTES,
+        DEFAULT_SOUND_ALSA_DEVICE,
+        DEFAULT_SOUND_ENABLED,
+        DEFAULT_SOUND_VOLUME,
+    )
 except ImportError:  # pragma: no cover - config is required at runtime
     DEFAULT_SOUND_ENABLED = True
     DEFAULT_SOUND_VOLUME = 0.6
+    DEFAULT_SOUND_ALSA_DEVICE = "plughw:2,0"
+    DEFAULT_SOUND_ALSA_CHUNK_BYTES = 4096
 from voice import VoicePrompter
 try:
     from config import (
@@ -517,9 +524,13 @@ class ScanSession:
     # ``session._sound = stub``.
     sound_enabled: bool = DEFAULT_SOUND_ENABLED
     sound_volume: float = DEFAULT_SOUND_VOLUME
+    # Linux-only ALSA backend for short WAV cues.  Only consumed when
+    # ``SoundPlayer`` selects the ``"alsa"`` backend (auto on Linux when
+    # neither winsound nor a CLI player is available).  Mirrors the
+    # ``mp3_device`` shape used by ``MP3Player``.
+    sound_alsa_device: str = DEFAULT_SOUND_ALSA_DEVICE
+    sound_alsa_chunk_bytes: int = DEFAULT_SOUND_ALSA_CHUNK_BYTES
     _sound: Optional[SoundPlayer] = field(default=None, init=False)
-    _sound_detect_start_played: bool = field(default=False, init=False)
-
     # Voice prompts (spoken cues layered on top of the tones).  Same
     # lazy / monkey-patchable contract as ``_sound`` above: tests can
     # drop in a stub via ``session._voice = ...`` and reconfigure via
@@ -740,6 +751,8 @@ class ScanSession:
             self._sound = SoundPlayer(
                 enabled=self.sound_enabled,
                 volume=self.sound_volume,
+                alsa_device=getattr(self, "sound_alsa_device", None),
+                alsa_chunk_bytes=getattr(self, "sound_alsa_chunk_bytes", None),
             )
         return self._sound
 
@@ -1268,6 +1281,7 @@ class ScanSession:
             # Audio cues -- play the single capture chime plus the
             # verbal confirmation.
             self.play_sound("captured")
+            self.play_mp3("captured")
             self.speak("stable")
             self.speak("capture_auto")
         else:
@@ -2598,6 +2612,15 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     p.add_argument("--mp3-deleted", type=str, default=None,
                    help=("Path to the MP3 played on page deletion "
                          "(default: <project_root>/deleted.mp3)."))
+    p.add_argument("--sound-alsa-device", type=str, default=None,
+                   help=("ALSA device for short WAV cues on Linux "
+                         "(default: plughw:2,0 = MAX98357A I2S amp). "
+                         "Only used when SoundPlayer selects the 'alsa' "
+                         "backend (auto on Linux when winsound and the CLI "
+                         "player are unavailable)."))
+    p.add_argument("--sound-alsa-chunk", type=int, default=None,
+                   help=("ALSA period size in bytes for short WAV cues "
+                         "(default: 4096)."))
     return p.parse_args(argv)
 
 
@@ -2681,9 +2704,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         session.sound_volume = float(args.sound_volume)
         # Force re-build of WAV cache at the new volume.
         session._sound = None
+    if getattr(args, "sound_alsa_device", None) is not None:
+        session.sound_alsa_device = str(args.sound_alsa_device)
+        # Force re-build so the new device string is honoured.
+        session._sound = None
+    if getattr(args, "sound_alsa_chunk", None) is not None:
+        session.sound_alsa_chunk_bytes = int(args.sound_alsa_chunk)
+        session._sound = None
     logger.info(
-        "Sound: enabled=%s volume=%.2f",
+        "Sound: enabled=%s volume=%.2f alsa_device=%s alsa_chunk=%d",
         session.sound_enabled, session.sound_volume,
+        getattr(session, "sound_alsa_device", None),
+        getattr(session, "sound_alsa_chunk_bytes", None),
     )
 
     # Voice CLI overrides --------------------------------------------------------

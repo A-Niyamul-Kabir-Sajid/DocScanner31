@@ -51,6 +51,11 @@ DEFAULT_ENABLED: bool = True
 DEFAULT_VOLUME: float = 0.6      # 0.0 (silent) - 1.0 (full)
 DEFAULT_SAMPLE_RATE: int = 22050 # Hz - plenty for short blips
 
+# ALSA backend defaults - match the Pi I2S amp conventions from ``mp3_player``
+# so the user can swap in raw synthesized tones alongside the long-form MP3s.
+DEFAULT_ALSA_DEVICE: str = "plughw:2,0"
+DEFAULT_ALSA_CHUNK_BYTES: int = 4096
+
 # --------------------------------------------------------------------------- #
 # Backends
 # --------------------------------------------------------------------------- #
@@ -78,6 +83,40 @@ def _cli_player_available() -> Optional[list]:
             if rc == 0:
                 return [player]
     return None
+
+
+def _alsa_available() -> bool:
+    """Return True if the Pi-style ALSA I2S backend is usable on this OS.
+
+    Requires ``pyalsaaudio`` to be importable and the binary ``ffmpeg`` on
+    ``$PATH`` (used by ``pydub`` to decode the WAV blob).  Falls through
+    to ``False`` on non-Linux and in environments without the I2S overlay.
+    """
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        import alsaaudio  # type: ignore[import-not-found]  # noqa: F401
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("alsa (pyalsaaudio) import failed: %s", exc)
+        return False
+    try:
+        from pydub import AudioSegment  # type: ignore[import-not-found]  # noqa: F401
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("alsa (pydub) import failed: %s", exc)
+        return False
+    if shutil_which("ffmpeg") is None:
+        logger.debug("alsa backend skipped: ffmpeg not on PATH")
+        return False
+    return True
+
+
+def shutil_which(cmd: str) -> Optional[str]:
+    """Thin wrapper around ``shutil.which`` so the module stays import-safe."""
+    import shutil
+    try:
+        return shutil.which(cmd)
+    except Exception:  # pragma: no cover - defensive
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -167,9 +206,14 @@ class SoundPlayer:
         enabled: bool = DEFAULT_ENABLED,
         volume: float = DEFAULT_VOLUME,
         backend: str = "auto",
+        *,
+        alsa_device: str = DEFAULT_ALSA_DEVICE,
+        alsa_chunk_bytes: int = DEFAULT_ALSA_CHUNK_BYTES,
     ) -> None:
         self.enabled = bool(enabled)
         self.volume = float(max(0.0, min(1.0, volume)))
+        self.alsa_device = str(alsa_device)
+        self.alsa_chunk_bytes = int(alsa_chunk_bytes)
         self._backend_name, self._backend = self._select_backend(backend)
         # Pre-render every WAV so playback is allocation-free on the
         # LIVE hot path.
@@ -188,8 +232,11 @@ class SoundPlayer:
         if self._backend_name == "winsound" and self.enabled:
             self._write_wav_files()
         if self.enabled:
-            logger.info("SoundPlayer enabled (backend=%s, volume=%.2f)",
-                        self._backend_name, self.volume)
+            extra = ""
+            if self._backend_name == "alsa":
+                extra = f", device={self.alsa_device}"
+            logger.info("SoundPlayer enabled (backend=%s, volume=%.2f%s)",
+                        self._backend_name, self.volume, extra)
         else:
             logger.info("SoundPlayer disabled")
 
@@ -226,21 +273,31 @@ class SoundPlayer:
                 logger.debug("winsound import failed: %s", exc)
 
         cli_argv = _cli_player_available()
+        alsa_ok = _alsa_available()
 
         if prefer == "winsound" and winsound is not None:
             return "winsound", winsound
         if prefer == "cli" and cli_argv is not None:
             return "cli", cli_argv
+        if prefer == "alsa" and alsa_ok:
+            # Sentinel: the actual device/format constants are read in
+            # ``_play_wav_alsa`` at dispatch time so they can be overridden
+            # by ``configure(alsa_device=..., alsa_chunk_bytes=...)``.
+            return "alsa", "alsa"
         # "auto"
         if winsound is not None:
             return "winsound", winsound
         if cli_argv is not None:
             return "cli", cli_argv
+        if alsa_ok:
+            return "alsa", "alsa"
         return "none", None
 
     # ------------------------------------------------------------------ #
     def configure(self, *, enabled: Optional[bool] = None,
-                  volume: Optional[float] = None) -> None:
+                  volume: Optional[float] = None,
+                  alsa_device: Optional[str] = None,
+                  alsa_chunk_bytes: Optional[int] = None) -> None:
         """Toggle enable/volume at runtime. Re-renders WAVs on volume change."""
         if enabled is not None:
             self.enabled = bool(enabled)
@@ -254,6 +311,10 @@ class SoundPlayer:
             self._cleanup_files()
             if self._backend_name == "winsound" and self.enabled:
                 self._write_wav_files()
+        if alsa_device is not None:
+            self.alsa_device = str(alsa_device)
+        if alsa_chunk_bytes is not None:
+            self.alsa_chunk_bytes = int(alsa_chunk_bytes)
 
     def _cleanup_files(self) -> None:
         """Delete any temp WAVs previously written for winsound playback."""
@@ -353,6 +414,47 @@ class SoundPlayer:
                         except OSError:
                             pass
                 threading.Thread(target=_run_and_cleanup, daemon=True).start()
+                return True
+            if name == "alsa" and backend == "alsa":
+                # Linux / Pi 5 I2S path: write the synth WAV through
+                # pydub -> pyalsaaudio -> plughw:<card>,<dev>.  Same
+                # pipeline shape as ``mp3_player.play_clip`` but the
+                # source bytes come from ``SoundPlayer._cache`` instead
+                # of an MP3 file, and we always emit S16_LE / mono at the
+                # synthesised sample rate so the DAC gets exactly what
+                # we built.  Runs on a daemon thread so the LIVE loop
+                # never blocks on the speaker-write.
+                device = self.alsa_device
+                chunk_bytes = self.alsa_chunk_bytes
+
+                def _run_alsa(wav_bytes: bytes = wav,
+                              dev: str = device,
+                              chunk: int = chunk_bytes) -> None:
+                    try:
+                        import alsaaudio  # type: ignore[import-not-found]
+                        from pydub import AudioSegment  # type: ignore[import-not-found]
+                        seg = AudioSegment.from_wav(io.BytesIO(wav_bytes))
+                        seg = seg.set_channels(1)
+                        seg = seg.set_sample_width(2)  # S16_LE
+                        # Keep the synthesised sample rate so the
+                        # attack/release envelope we wrote in
+                        # ``_sine`` survives the plughw resampler.
+                        pcm = alsaaudio.PCM(device=dev,
+                                            mode=alsaaudio.PCM_NORMAL)
+                        pcm.setchannels(1)
+                        pcm.setrate(seg.frame_rate)
+                        pcm.setformat(alsaaudio.PCM_FORMAT_S16_LE)
+                        pcm.setperiodsize(chunk)
+                        raw = seg.raw_data
+                        for off in range(0, len(raw), chunk):
+                            pcm.write(raw[off:off + chunk])
+                    except Exception as exc:  # pragma: no cover - defensive
+                        logger.debug("alsa sound playback failed: %s", exc)
+
+                threading.Thread(
+                    target=_run_alsa, daemon=True,
+                    name=f"sound-alsa-{event_name or 'wav'}",
+                ).start()
                 return True
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("sound backend %s failed: %s", name, exc)
