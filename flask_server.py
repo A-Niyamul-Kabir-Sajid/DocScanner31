@@ -153,6 +153,13 @@ class FlaskServer:
             template_folder=str(TEMPLATES_DIR),
             static_folder=str(TEMPLATES_DIR),
         )
+        # Re-read index.html on every request instead of caching the compiled
+        # template.  The server runs with debug=False (so Jinja would otherwise
+        # cache it in memory and a browser refresh wouldn't pick up edits until
+        # the whole app is restarted).  This keeps front-end tweaks a plain
+        # reload away.
+        app.config["TEMPLATES_AUTO_RELOAD"] = True
+        app.jinja_env.auto_reload = True
 
         @app.route("/")
         def index():
