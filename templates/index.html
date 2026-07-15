@@ -4,27 +4,18 @@
     <meta charset="utf-8">
     <title>Smart Document Scanner</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="dark">
+    <meta name="color-scheme" content="dark light">
     <style>
         /* ----------------------------------------------------------------
            Tokens — tuned for an embedded / Raspberry Pi 5 display.
-           Pure CSS (no fonts, no CDN) so the page renders fully offline
-           and stays under ~6 KB after gzip.
+           Pure CSS (no fonts, no CDN) so the page renders fully offline.
         ---------------------------------------------------------------- */
         :root {
-            --bg-0:   #0b1020;
-            --bg-1:   #121935;
-            --bg-2:   #1a2347;
-            --line:   #2a3563;
-            --text:   #e6ecff;
-            --muted:  #8a93b8;
-            --brand:  #4f8cff;
-            --brand-2:#7aa9ff;
-            --ok:     #2bd49c;
-            --warn:   #ffb547;
-            --err:    #ff5d6c;
-            --chip:   #1f2a55;
-            --shadow: 0 10px 30px rgba(0,0,0,.45);
+            --bg-0:#0b1020; --bg-1:#121935; --bg-2:#1a2347;
+            --line:#2a3563; --text:#e6ecff; --muted:#8a93b8;
+            --brand:#4f8cff; --brand-2:#7aa9ff;
+            --ok:#2bd49c; --warn:#ffb547; --err:#ff5d6c;
+            --chip:#1f2a55; --shadow:0 10px 30px rgba(0,0,0,.45);
         }
         @media (prefers-color-scheme: light) {
             :root {
@@ -34,7 +25,6 @@
                 --chip:#e9eef9; --shadow:0 8px 22px rgba(20,24,43,.08);
             }
         }
-
         * { box-sizing: border-box; }
         html, body { height: 100%; }
         body {
@@ -48,19 +38,15 @@
                 var(--bg-0);
             -webkit-font-smoothing: antialiased;
         }
-
         a { color: var(--brand-2); text-decoration: none; }
         a:hover { text-decoration: underline; }
         kbd {
             font: 600 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
             padding: 2px 6px; border-radius: 4px;
-            background: var(--chip); color: var(--text);
-            border: 1px solid var(--line);
+            background: var(--chip); color: var(--text); border: 1px solid var(--line);
         }
 
-        /* ----------------------------------------------------------------
-           Header
-        ---------------------------------------------------------------- */
+        /* ---------- header ---------- */
         header.top {
             position: sticky; top: 0; z-index: 10;
             backdrop-filter: saturate(140%) blur(8px);
@@ -71,193 +57,138 @@
             header.top { background: linear-gradient(180deg, rgba(255,255,255,.9), rgba(255,255,255,.6)); }
         }
         .top-inner {
-            max-width: 1200px; margin: 0 auto;
-            padding: 14px 22px;
-            display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+            max-width: 1280px; margin: 0 auto; padding: 12px 20px;
+            display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
         }
-        .brand {
-            display: flex; align-items: center; gap: 10px;
-            font-weight: 700; letter-spacing: .2px;
-        }
+        .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; }
         .brand-mark {
             width: 28px; height: 28px; border-radius: 8px;
             background: linear-gradient(135deg, var(--brand), var(--ok));
             box-shadow: 0 6px 18px rgba(79,140,255,.45);
-            display: grid; place-items: center;
-            color: #fff; font-size: 14px; font-weight: 800;
+            display: grid; place-items: center; color: #fff; font-size: 14px; font-weight: 800;
         }
         .brand small { color: var(--muted); font-weight: 500; margin-left: 4px; }
         .top-spacer { flex: 1; }
+        .statusline {
+            display: flex; gap: 8px; flex-wrap: wrap; align-items: center;
+            color: var(--muted); font-size: 13px;
+        }
+        .statusline .pill {
+            display: inline-flex; align-items: center; gap: 6px;
+            font-size: 12px; padding: 3px 10px; border-radius: 999px;
+            background: var(--chip); color: var(--text);
+        }
+        .pill.ok { background: rgba(43,212,156,.18); color: var(--ok); }
+        .pill.warn { background: rgba(255,181,71,.18); color: var(--warn); }
 
-        /* ----------------------------------------------------------------
-           KPI tiles
-        ---------------------------------------------------------------- */
-        .kpis {
-            max-width: 1200px; margin: 18px auto 0; padding: 0 22px;
-            display: grid; gap: 14px;
-            grid-template-columns: repeat(4, minmax(0, 1fr));
-        }
-        @media (max-width: 720px) {
-            .kpis { grid-template-columns: repeat(2, 1fr); }
-        }
-        .kpi {
-            background: linear-gradient(180deg, var(--bg-1), var(--bg-2));
-            border: 1px solid var(--line);
-            border-radius: 14px;
-            padding: 14px 16px;
-            box-shadow: var(--shadow);
-        }
-        .kpi .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .8px; }
-        .kpi .value { font-size: 26px; font-weight: 700; margin-top: 4px; }
-        .kpi.ok    .value { color: var(--ok); }
-        .kpi.warn  .value { color: var(--warn); }
+        main { max-width: 1280px; margin: 0 auto; padding: 16px 20px 60px; }
 
-        /* ----------------------------------------------------------------
-           Layout grid
-        ---------------------------------------------------------------- */
-        main {
-            max-width: 1200px; margin: 0 auto;
-            padding: 18px 22px 60px;
-            display: grid; gap: 22px;
-            grid-template-columns: 1fr;
-        }
-        section.card {
-            background: var(--bg-1);
-            border: 1px solid var(--line);
-            border-radius: 14px;
-            box-shadow: var(--shadow);
-            overflow: hidden;
-        }
-        section.card > header {
-            padding: 12px 16px;
-            display: flex; align-items: center; gap: 10px;
-            border-bottom: 1px solid var(--line);
-            background: linear-gradient(180deg, rgba(255,255,255,.02), transparent);
-        }
-        section.card > header h2 {
-            font-size: 14px; margin: 0; letter-spacing: .4px;
-            text-transform: uppercase; color: var(--muted); font-weight: 600;
-        }
-        section.card > header .right { margin-left: auto; }
-        section.card > .body { padding: 14px 16px 18px; }
-
-        /* ----------------------------------------------------------------
-           Controls
-        ---------------------------------------------------------------- */
-        .actions {
-            display: grid; gap: 10px;
-            grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+        /* ---------- control bar ---------- */
+        .controls {
+            display: grid; gap: 10px; margin-bottom: 18px;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
         }
         button {
             appearance: none; border: 1px solid var(--line);
             background: var(--bg-2); color: var(--text);
-            padding: 11px 14px; border-radius: 10px;
-            font: inherit; font-weight: 600;
-            cursor: pointer;
-            transition: transform .04s ease, background .15s ease, border-color .15s ease;
+            padding: 12px 14px; border-radius: 10px; font: inherit; font-weight: 600;
+            cursor: pointer; transition: transform .04s ease, background .15s ease, border-color .15s ease;
             display: inline-flex; align-items: center; gap: 8px; justify-content: center;
         }
-        button:hover  { background: #243169; border-color: #384a8a; }
+        button:hover { background: #243169; border-color: #384a8a; }
         button:active { transform: translateY(1px); }
         button.primary { background: linear-gradient(180deg, var(--brand), var(--brand-2)); border-color: transparent; color: #fff; }
-        button.primary:hover { filter: brightness(1.05); }
-        button.danger  { background: #c0392b; border-color: transparent; color: #fff; }
-        button.danger:hover  { background: #a93226; }
-        button.ghost   { background: transparent; }
+        button.danger { background: #c0392b; border-color: transparent; color: #fff; }
+        button.danger:hover { background: #a93226; }
         button[disabled] { opacity: .55; cursor: progress; }
-        .icon { width: 16px; height: 16px; flex: none; }
 
-        .shortcuts {
-            display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
-            color: var(--muted); font-size: 13px;
+        /* ---------- live board ---------- */
+        .board-title {
+            font-size: 12px; letter-spacing: .8px; text-transform: uppercase;
+            color: var(--muted); font-weight: 600; margin: 18px 2px 8px;
         }
-
-        /* ----------------------------------------------------------------
-           Gallery
-        ---------------------------------------------------------------- */
-        .gallery {
+        .board {
             display: grid; gap: 12px;
-            grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+            grid-template-columns: repeat(5, minmax(0, 1fr));
         }
-        .gallery figure {
-            margin: 0; position: relative; overflow: hidden;
-            border-radius: 10px; border: 1px solid var(--line);
-            background: var(--bg-2);
+        @media (max-width: 1000px) { .board { grid-template-columns: repeat(3, 1fr); } }
+        @media (max-width: 620px)  { .board { grid-template-columns: repeat(2, 1fr); } }
+        figure.tile {
+            margin: 0; position: relative; overflow: hidden; cursor: zoom-in;
+            border-radius: 12px; border: 1px solid var(--line);
+            background: var(--bg-1); box-shadow: var(--shadow);
+            transition: border-color .15s ease, transform .06s ease;
         }
-        .gallery img {
-            width: 100%; height: 130px; object-fit: cover; display: block;
-            background: #000;
+        figure.tile:hover { border-color: var(--brand); }
+        figure.tile:active { transform: translateY(1px); }
+        figure.tile img {
+            width: 100%; aspect-ratio: 4/3; object-fit: contain; display: block; background: #000;
         }
-        .gallery figcaption {
-            font-size: 12px; padding: 6px 8px;
-            color: var(--muted);
-            display: flex; justify-content: space-between; align-items: center;
+        figure.tile figcaption {
+            display: flex; align-items: center; justify-content: space-between;
+            gap: 6px; padding: 8px 10px; font-size: 12.5px; color: var(--text);
+            border-top: 1px solid var(--line);
         }
-        .gallery .badge {
-            position: absolute; top: 6px; left: 6px;
-            background: rgba(0,0,0,.55); color: #fff;
-            font-size: 11px; padding: 2px 6px; border-radius: 999px;
-        }
-        .empty {
-            color: var(--muted);
-            padding: 22px; text-align: center; border: 1px dashed var(--line);
-            border-radius: 10px; background: rgba(255,255,255,.02);
+        figure.tile .num {
+            font-size: 11px; color: var(--muted);
+            background: var(--chip); border-radius: 999px; padding: 1px 7px;
         }
 
-        /* ----------------------------------------------------------------
-           Saved PDFs table
-        ---------------------------------------------------------------- */
-        table.docs {
-            width: 100%; border-collapse: collapse;
-            font-size: 14px;
+        /* ---------- modal popup ---------- */
+        .modal {
+            position: fixed; inset: 0; z-index: 100; display: none;
+            align-items: center; justify-content: center; padding: 24px;
+            background: rgba(4,7,18,.78); backdrop-filter: blur(4px);
         }
-        table.docs th, table.docs td {
-            text-align: left; padding: 10px 12px;
+        .modal.open { display: flex; }
+        .modal-inner {
+            background: var(--bg-1); border: 1px solid var(--line);
+            border-radius: 14px; box-shadow: var(--shadow);
+            max-width: 96vw; max-height: 94vh; display: flex; flex-direction: column; overflow: hidden;
+        }
+        .modal-head {
+            display: flex; align-items: center; gap: 12px; padding: 12px 16px;
             border-bottom: 1px solid var(--line);
         }
-        table.docs th {
-            color: var(--muted); font-weight: 600; font-size: 12px;
-            text-transform: uppercase; letter-spacing: .6px;
+        .modal-head h3 { margin: 0; font-size: 15px; }
+        .modal-head .grow { flex: 1; }
+        .modal-body { padding: 10px; overflow: auto; background: #000; }
+        .modal-body img { max-width: 90vw; max-height: 76vh; display: block; margin: 0 auto; }
+        .close-x {
+            border: 1px solid var(--line); background: var(--bg-2); color: var(--text);
+            width: 34px; height: 34px; border-radius: 8px; cursor: pointer; font-size: 18px; line-height: 1;
         }
-        table.docs tr:hover td { background: rgba(255,255,255,.02); }
-        table.docs td.qr img {
-            height: 38px; width: 38px; object-fit: contain;
-            border-radius: 6px; background: #fff; padding: 2px;
+
+        /* ---------- gallery / saved PDFs ---------- */
+        details.gallery-wrap { margin-top: 22px; }
+        details.gallery-wrap > summary {
+            cursor: pointer; color: var(--muted); font-size: 13px;
+            padding: 8px 2px; user-select: none;
         }
-        .pill {
-            display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px;
-            background: var(--chip); color: var(--text);
-        }
+        .gallery { display: grid; gap: 12px; margin-top: 10px;
+            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+        .gallery figure { margin: 0; border-radius: 10px; border: 1px solid var(--line);
+            background: var(--bg-2); overflow: hidden; }
+        .gallery img { width: 100%; height: 110px; object-fit: cover; display: block; background: #000; }
+        .gallery figcaption { font-size: 12px; padding: 6px 8px; color: var(--muted); }
+        table.docs { width: 100%; border-collapse: collapse; font-size: 14px; margin-top: 10px; }
+        table.docs th, table.docs td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); }
+        table.docs th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; }
+        table.docs td.qr img { height: 34px; width: 34px; object-fit: contain; border-radius: 6px; background: #fff; padding: 2px; }
         .pill.latest { background: rgba(43,212,156,.18); color: var(--ok); }
+        .empty { color: var(--muted); padding: 18px; text-align: center;
+            border: 1px dashed var(--line); border-radius: 10px; }
 
-        /* ----------------------------------------------------------------
-           Toast
-        ---------------------------------------------------------------- */
-        .toast-wrap {
-            position: fixed; right: 18px; bottom: 18px; z-index: 50;
-            display: flex; flex-direction: column; gap: 8px;
-            pointer-events: none;
-        }
-        .toast {
-            pointer-events: auto;
-            background: var(--bg-1); color: var(--text);
+        /* ---------- toast ---------- */
+        .toast-wrap { position: fixed; right: 18px; bottom: 18px; z-index: 200;
+            display: flex; flex-direction: column; gap: 8px; pointer-events: none; }
+        .toast { pointer-events: auto; background: var(--bg-1); color: var(--text);
             border: 1px solid var(--line); border-left: 3px solid var(--brand);
-            border-radius: 10px; padding: 10px 14px; min-width: 220px;
-            box-shadow: var(--shadow);
-            font-size: 14px;
-            animation: slidein .25s ease;
-        }
-        .toast.ok  { border-left-color: var(--ok); }
+            border-radius: 10px; padding: 10px 14px; min-width: 220px; box-shadow: var(--shadow);
+            font-size: 14px; animation: slidein .25s ease; }
+        .toast.ok { border-left-color: var(--ok); }
         .toast.err { border-left-color: var(--err); }
-        @keyframes slidein {
-            from { transform: translateY(8px); opacity: 0; }
-            to   { transform: translateY(0);    opacity: 1; }
-        }
-
-        /* tiny utilities */
-        .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-        .grow { flex: 1; }
-        .muted { color: var(--muted); }
+        @keyframes slidein { from { transform: translateY(8px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
     </style>
 </head>
 <body>
@@ -266,314 +197,241 @@
     <div class="top-inner">
         <div class="brand">
             <div class="brand-mark">DS</div>
-            <div>Smart Document Scanner <small>· control panel</small></div>
+            <div>Smart Document Scanner <small>· live pipeline</small></div>
         </div>
         <div class="top-spacer"></div>
-        <div class="shortcuts">
-            <span><kbd>C</kbd> capture</span>
-            <span><kbd>D</kbd> finish PDF</span>
-            <span><kbd>N</kbd> new session</span>
-            <span><kbd>X</kbd> delete last</span>
-            <span><kbd>Q</kbd> quit</span>
+        <div class="statusline">
+            <span class="pill ok"><span id="stPages">{{ session_pages }}</span>&nbsp;page(s)</span>
+            <span class="pill" id="stMode">mode: —</span>
+            <span class="pill warn" id="stPhase">auto: —</span>
+            <span class="pill" id="stMsg">—</span>
         </div>
     </div>
 </header>
 
-<!-- KPI tiles -->
-<section class="kpis" aria-label="Status">
-    <div class="kpi">
-        <div class="label">Current session</div>
-        <div class="value"><span id="sessionCount">{{ session_pages }}</span>
-            <span class="muted" style="font-size:13px;font-weight:500">page{% if session_pages != 1 %}s{% endif %}</span>
-        </div>
-    </div>
-    <div class="kpi ok">
-        <div class="label">Saved PDFs</div>
-        <div class="value">{{ pdfs|length }}</div>
-    </div>
-    <div class="kpi">
-        <div class="label">Latest document</div>
-        <div class="value" style="font-size:18px">
-            {% if latest %}#{{ "%03d"|format(latest_num) }}{% else %}—{% endif %}
-        </div>
-    </div>
-    <div class="kpi warn">
-        <div class="label">Web UI</div>
-        <div class="value" style="font-size:16px;font-weight:600">http://{{ request.host }}</div>
-    </div>
-</section>
-
 <main>
 
-    <!-- Actions -->
-    <section class="card">
-        <header>
-            <h2>Actions</h2>
-            <div class="right muted" id="lastMsg">—</div>
-        </header>
-        <div class="body">
-            <div class="actions">
-                <button id="finishBtn" class="primary" title="Save the current session as document_NNN.pdf and start a new one">
-                    Finish PDF <kbd>D</kbd>
-                </button>
-                <button id="newSessBtn" title="Close PDF_VIEW dialog and start a fresh document">
-                    New session <kbd>N</kbd>
-                </button>
-                <button id="deleteLastBtn" title="Remove the last captured page from this session">
-                    Delete last page <kbd>X</kbd>
-                </button>
-                <button id="quitBtn" class="danger" title="Save current pages (with confirm) and quit the app">
-                    Quit <kbd>Q</kbd>
-                </button>
-            </div>
-            <p class="muted" style="margin: 12px 2px 0; font-size: 13px;">
-                Tip: the desktop window keeps the live camera feed; this page is the
-                companion control panel for finishing PDFs, browsing captures, and
-                downloading the QR codes that link to each PDF.
-            </p>
-        </div>
-    </section>
+    <!-- Control bar (works from here and from inside the popup) -->
+    <div class="controls">
+        <button id="captureBtn" class="primary" title="Capture the current page">Capture <kbd>C</kbd></button>
+        <button id="finishBtn"  title="Save this session as document_NNN.pdf">Finish PDF <kbd>D</kbd></button>
+        <button id="deleteBtn"  title="Remove the last captured page">Delete last <kbd>X</kbd></button>
+        <button id="newBtn"     title="Start a fresh document">New session <kbd>N</kbd></button>
+        <button id="quitBtn" class="danger" title="Save (with confirm) and quit">Quit <kbd>Q</kbd></button>
+    </div>
 
-    <!-- Captured pages gallery -->
-    <section class="card">
-        <header>
-            <h2>Captured pages <small class="muted" style="text-transform:none;letter-spacing:0">(this session)</small></h2>
-            <div class="right"><span class="pill" id="capPill">{{ captures|length }} in buffer</span></div>
-        </header>
-        <div class="body">
+    <!-- Live board: 5 up + 5 down.  Tiles are filled by JS from data-stages. -->
+    <div class="board-title">Live pipeline · top row</div>
+    <div class="board" id="boardTop"></div>
+
+    <div class="board-title">Live pipeline · bottom row</div>
+    <div class="board" id="boardBottom"></div>
+
+    <!-- Saved output (collapsed by default) -->
+    <details class="gallery-wrap">
+        <summary>Captured pages &amp; saved PDFs</summary>
+
+        <div id="capturesWrap">
             {% if captures %}
                 <div class="gallery" id="gallery">
                     {% for name in captures %}
                         <figure>
-                            <span class="badge">#{{ loop.index }}</span>
                             <img src="{{ url_for('serve_capture', filename=name) }}" alt="{{ name }}" loading="lazy">
-                            <figcaption><span>{{ name }}</span></figcaption>
+                            <figcaption>#{{ loop.index }} · {{ name }}</figcaption>
                         </figure>
                     {% endfor %}
                 </div>
             {% else %}
-                <div class="empty" id="emptyCaptures">No pages captured yet — press <kbd>C</kbd> in the desktop window.</div>
+                <div class="empty" id="emptyCaptures">No pages captured yet — press <kbd>C</kbd>.</div>
             {% endif %}
         </div>
-    </section>
 
-    <!-- Saved PDFs -->
-    <section class="card">
-        <header>
-            <h2>Saved PDFs</h2>
-            <div class="right">
-                {% if latest %}
-                    <a class="pill latest" href="{{ latest_url }}">⇣ latest · {{ latest }}</a>
-                {% endif %}
-            </div>
-        </header>
-        <div class="body">
-            {% if pdfs %}
-                <table class="docs">
-                    <thead>
-                        <tr>
-                            <th>#</th>
-                            <th>File</th>
-                            <th>QR</th>
-                            <th class="muted">Links</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                    {% for num, name in pdfs %}
-                        <tr>
-                            <td><span class="pill">#{{ "%03d"|format(num) }}</span></td>
-                            <td><a href="{{ url_for('download_pdf', doc_id=num) }}">{{ name }}</a></td>
-                            <td class="qr">
-                                {% set qr_name = 'document_%03d.png'|format(num) %}
-                                {% if qr_name in qrs|map(attribute=1)|list %}
-                                    <a href="{{ url_for('download_qr', doc_id=num) }}" title="Open QR">
-                                        <img src="{{ url_for('download_qr', doc_id=num) }}" alt="QR for {{ name }}">
-                                    </a>
-                                {% else %}
-                                    <span class="muted">—</span>
-                                {% endif %}
-                            </td>
-                            <td>
-                                <a href="{{ url_for('download_pdf', doc_id=num) }}">PDF</a>
-                                {% if qr_name in qrs|map(attribute=1)|list %}
-                                    · <a href="{{ url_for('download_qr', doc_id=num) }}">QR</a>
-                                {% endif %}
-                            </td>
-                        </tr>
-                    {% endfor %}
-                    </tbody>
-                </table>
-            {% else %}
-                <div class="empty">No PDFs saved yet — press <kbd>D</kbd> to finish a session.</div>
-            {% endif %}
-        </div>
-    </section>
-
+        {% if pdfs %}
+            <table class="docs">
+                <thead><tr><th>#</th><th>File</th><th>QR</th><th>Links</th></tr></thead>
+                <tbody>
+                {% for num, name in pdfs %}
+                    <tr>
+                        <td><span class="pill">#{{ "%03d"|format(num) }}</span></td>
+                        <td><a href="{{ url_for('download_pdf', doc_id=num) }}">{{ name }}</a></td>
+                        <td class="qr">
+                            {% set qr_name = 'document_%03d.png'|format(num) %}
+                            {% if qr_name in qrs|map(attribute=1)|list %}
+                                <a href="{{ url_for('download_qr', doc_id=num) }}"><img src="{{ url_for('download_qr', doc_id=num) }}" alt="QR"></a>
+                            {% else %}<span class="muted">—</span>{% endif %}
+                        </td>
+                        <td>
+                            <a href="{{ url_for('download_pdf', doc_id=num) }}">PDF</a>
+                            {% if qr_name in qrs|map(attribute=1)|list %} · <a href="{{ url_for('download_qr', doc_id=num) }}">QR</a>{% endif %}
+                        </td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        {% else %}
+            <div class="empty" style="margin-top:10px">No PDFs saved yet — press <kbd>D</kbd>.</div>
+        {% endif %}
+    </details>
 </main>
+
+<!-- Popup -->
+<div class="modal" id="modal" aria-hidden="true">
+    <div class="modal-inner">
+        <div class="modal-head">
+            <h3 id="modalTitle">Panel</h3>
+            <div class="grow"></div>
+            <button class="close-x" id="modalClose" title="Close (Esc)">×</button>
+        </div>
+        <div class="modal-body"><img id="modalImg" alt="enlarged live panel"></div>
+    </div>
+</div>
 
 <div class="toast-wrap" id="toasts" aria-live="polite"></div>
 
 <script>
-/* ----------------------------------------------------------------------
-   Vanilla JS — no frameworks, no CDN.  Tuned for low CPU on a Pi 5.
----------------------------------------------------------------------- */
-const $  = (s, r=document) => r.querySelector(s);
-const $$ = (s, r=document) => Array.from(r.querySelectorAll(s));
+/* ---------------------------------------------------------------------- */
+const $ = (s, r=document) => r.querySelector(s);
+
+/* The 10 panels, in the user's 5-up / 5-down formation.  `stage` matches the
+   keys the camera loop publishes to the frame bus. */
+const TOP = [
+    { stage: "original", label: "Original" },
+    { stage: "gray",     label: "Gray" },
+    { stage: "binary",   label: "Binary (edges)" },
+    { stage: "contours", label: "Contours" },
+    { stage: "present",  label: "Present (what C saves)" },
+];
+const BOTTOM = [
+    { stage: "selected",      label: "Selected contour" },
+    { stage: "page_color",    label: "Colored page doc" },
+    { stage: "page_gray",     label: "Grey page doc" },
+    { stage: "page_bw",       label: "Black & white" },
+    { stage: "last_captured", label: "Last captured (static)" },
+];
+
+/* Build a tile.  Grid images use a downscaled stream (?w=480) to spare the Pi;
+   the popup opens the full-resolution stream. */
+function makeTile(item, n) {
+    const fig = document.createElement("figure");
+    fig.className = "tile";
+    fig.dataset.stage = item.stage;
+    fig.dataset.label = item.label;
+    fig.innerHTML =
+        `<img src="/stream/${item.stage}?w=480" alt="${item.label}">` +
+        `<figcaption><span>${item.label}</span><span class="num">${n}</span></figcaption>`;
+    fig.addEventListener("click", () => openModal(item));
+    return fig;
+}
+TOP.forEach((it, i)    => $("#boardTop").appendChild(makeTile(it, i + 1)));
+BOTTOM.forEach((it, i) => $("#boardBottom").appendChild(makeTile(it, i + 6)));
+
+/* ---------- modal (grid keeps streaming underneath) ---------- */
+const modal = $("#modal"), modalImg = $("#modalImg"), modalTitle = $("#modalTitle");
+function openModal(item) {
+    modalTitle.textContent = item.label;
+    modalImg.src = "/stream/" + item.stage;   // full-res stream
+    modal.classList.add("open");
+    modal.setAttribute("aria-hidden", "false");
+}
+function closeModal() {
+    modal.classList.remove("open");
+    modal.setAttribute("aria-hidden", "true");
+    modalImg.src = "";   // drop the connection so the Pi isn't encoding a hidden stream
+}
+$("#modalClose").onclick = closeModal;
+modal.addEventListener("click", (e) => { if (e.target === modal) closeModal(); });
 
 /* ---------- toast ---------- */
-function toast(msg, kind = "ok", ttl = 3200) {
-    const wrap = $("#toasts");
+function toast(msg, kind = "ok", ttl = 3000) {
     const el = document.createElement("div");
-    el.className = "toast " + kind;
-    el.textContent = msg;
-    wrap.appendChild(el);
-    setTimeout(() => {
-        el.style.transition = "opacity .25s";
-        el.style.opacity = "0";
-        setTimeout(() => el.remove(), 260);
-    }, ttl);
+    el.className = "toast " + kind; el.textContent = msg;
+    $("#toasts").appendChild(el);
+    setTimeout(() => { el.style.transition = "opacity .25s"; el.style.opacity = "0";
+        setTimeout(() => el.remove(), 260); }, ttl);
 }
 
-/* ---------- network helpers ---------- */
+/* ---------- network ---------- */
 async function postJSON(url) {
     const res = await fetch(url, { method: "POST" });
-    let body;
-    try { body = await res.json(); } catch { body = {}; }
+    let body; try { body = await res.json(); } catch { body = {}; }
     if (!res.ok) throw new Error(body.error || res.statusText || ("HTTP " + res.status));
     return body;
 }
-
-/* ---------- live status refresh (no full page reload) ---------- */
-let pollTimer = null;
-async function refreshStatus() {
-    try {
-        const r = await fetch("/api/status", { cache: "no-store" });
-        if (!r.ok) return;
-        const s = await r.json();
-
-        // session counter
-        $("#sessionCount").textContent = s.session_pages;
-
-        // gallery (cheap DOM diff)
-        const g = $("#gallery");
-        const empty = $("#emptyCaptures");
-        if (!s.captures.length) {
-            if (g) g.remove();
-            if (!empty) {
-                const div = document.createElement("div");
-                div.className = "empty";
-                div.id = "emptyCaptures";
-                div.innerHTML = 'No pages captured yet — press <kbd>C</kbd> in the desktop window.';
-                document.querySelector(".card:nth-of-type(2) .body").appendChild(div);
-            }
-        } else {
-            if (empty) empty.remove();
-            if (!g) {
-                const div = document.createElement("div");
-                div.className = "gallery";
-                div.id = "gallery";
-                document.querySelector(".card:nth-of-type(2) .body").appendChild(div);
-            }
-            // rebuild (gallery is small; full rewrite is fine and bullet-proof)
-            $("#gallery").innerHTML = s.captures.map((name, i) => `
-                <figure>
-                    <span class="badge">#${i+1}</span>
-                    <img src="/captures/${encodeURIComponent(name)}?t=${Date.now()}"
-                         alt="${name}" loading="lazy">
-                    <figcaption><span>${name}</span></figcaption>
-                </figure>`).join("");
-        }
-        $("#capPill").textContent = s.captures.length + " in buffer";
-
-        // last message
-        if (s.last_message) $("#lastMsg").textContent = s.last_message;
-    } catch (e) { /* swallow — next tick will retry */ }
-}
-function startPolling() {
-    if (pollTimer) return;
-    pollTimer = setInterval(refreshStatus, 4000);
-    refreshStatus();
-}
-
-/* ---------- action wiring ---------- */
 function busy(btn, on) { btn.disabled = !!on; }
 
+/* ---------- actions ---------- */
+$("#captureBtn").onclick = async () => {
+    const b = $("#captureBtn"); busy(b, true);
+    try {
+        const r = await postJSON("/capture");
+        if (r.ok) toast("Captured — " + r.session_pages + " page(s)", "ok");
+        else      toast(r.message || "Capture rejected", "err");
+    } catch (e) { toast("Capture failed: " + e.message, "err"); }
+    finally { busy(b, false); }
+};
 $("#finishBtn").onclick = async () => {
-    const btn = $("#finishBtn");
-    busy(btn, true);
-    try {
-        const r = await postJSON("/finish");
-        toast("PDF saved: " + (r.pdf_name || "scan"), "ok");
-        setTimeout(() => location.reload(), 600);   // refresh the saved-PDF table
-    } catch (e) { toast("Finish failed: " + e.message, "err"); }
-    finally    { busy(btn, false); }
+    const b = $("#finishBtn"); busy(b, true);
+    try { const r = await postJSON("/finish"); toast("PDF saved: " + (r.pdf_name || "scan"), "ok"); }
+    catch (e) { toast("Finish failed: " + e.message, "err"); }
+    finally { busy(b, false); }
 };
-
-$("#newSessBtn").onclick = async () => {
-    const btn = $("#newSessBtn");
-    busy(btn, true);
-    try {
-        await postJSON("/new-session");
-        toast("Started a new session", "ok");
-        setTimeout(() => location.reload(), 400);
-    } catch (e) { toast("New session failed: " + e.message, "err"); }
-    finally    { busy(btn, false); }
-};
-
-$("#deleteLastBtn").onclick = async () => {
-    const btn = $("#deleteLastBtn");
-    busy(btn, true);
+$("#deleteBtn").onclick = async () => {
+    const b = $("#deleteBtn"); busy(b, true);
     try {
         const r = await postJSON("/delete-last-page");
-        if (r.ok) toast("Last page deleted — " + r.session_pages + " page(s) left", "ok");
+        if (r.ok) toast("Deleted — " + r.session_pages + " left", "ok");
         else      toast("No pages to delete", "err");
-        refreshStatus();
     } catch (e) { toast("Delete failed: " + e.message, "err"); }
-    finally    { busy(btn, false); }
+    finally { busy(b, false); }
 };
-
+$("#newBtn").onclick = async () => {
+    const b = $("#newBtn"); busy(b, true);
+    try { await postJSON("/new-session"); toast("New session started", "ok"); }
+    catch (e) { toast("New session failed: " + e.message, "err"); }
+    finally { busy(b, false); }
+};
 $("#quitBtn").onclick = async () => {
-    const pages = parseInt($("#sessionCount").textContent || "0", 10);
+    const pages = parseInt($("#stPages").textContent || "0", 10);
     if (pages > 0) {
-        const ok = window.confirm(
-            pages + " page(s) are captured in this session.\n" +
-            "Save them as document_NNN.pdf before quitting?"
-        );
-        if (!ok) {
-            const discard = window.confirm(
-                "Discard the " + pages + " page(s) and quit without saving?"
-            );
-            if (!discard) return;     // user cancelled both
-            try {
-                await postJSON("/quit?discard=1");
-                toast("Discarded — quitting…", "ok");
-            } catch (e) { toast("Quit failed: " + e.message, "err"); }
-            return;
+        if (window.confirm(pages + " page(s) captured. Save as PDF before quitting?")) {
+            try { await postJSON("/quit?save=1"); toast("Saved — quitting…", "ok"); }
+            catch (e) { toast("Quit failed: " + e.message, "err"); }
+        } else if (window.confirm("Discard the " + pages + " page(s) and quit?")) {
+            try { await postJSON("/quit?discard=1"); toast("Discarded — quitting…", "ok"); }
+            catch (e) { toast("Quit failed: " + e.message, "err"); }
         }
-        try {
-            await postJSON("/quit?save=1");
-            toast("Saved — quitting…", "ok");
-        } catch (e) { toast("Quit failed: " + e.message, "err"); }
         return;
     }
     try { await postJSON("/quit"); toast("Quitting…", "ok"); }
     catch (e) { toast("Quit failed: " + e.message, "err"); }
 };
 
-/* ---------- keyboard shortcuts (mirror the desktop window) ---------- */
+/* ---------- keyboard (mirrors the desktop hotkeys) ---------- */
 window.addEventListener("keydown", (ev) => {
-    // ignore when typing in inputs
     if (/^(input|textarea|select)$/i.test(ev.target.tagName)) return;
+    if (ev.key === "Escape") { if (modal.classList.contains("open")) closeModal(); return; }
     const k = ev.key.toLowerCase();
-    if      (k === "c") { /* capture is handled by the desktop window */ }
-    else if (k === "d") { $("#finishBtn").click(); }
-    else if (k === "n") { $("#newSessBtn").click(); }
-    else if (k === "x") { $("#deleteLastBtn").click(); }
-    else if (k === "q") { $("#quitBtn").click(); }
+    if      (k === "c") $("#captureBtn").click();
+    else if (k === "d") $("#finishBtn").click();
+    else if (k === "x") $("#deleteBtn").click();
+    else if (k === "n") $("#newBtn").click();
+    else if (k === "q") $("#quitBtn").click();
 });
 
-/* ---------- go ---------- */
-startPolling();
+/* ---------- status strip ---------- */
+async function refreshStatus() {
+    try {
+        const r = await fetch("/api/status", { cache: "no-store" });
+        if (!r.ok) return;
+        const s = await r.json();
+        $("#stPages").textContent = s.session_pages;
+        if (s.scan_mode) $("#stMode").textContent = "mode: " + s.scan_mode;
+        if (s.auto_capture_phase) $("#stPhase").textContent = "auto: " + s.auto_capture_phase;
+        if (s.last_message) $("#stMsg").textContent = s.last_message;
+    } catch (e) { /* retry next tick */ }
+}
+setInterval(refreshStatus, 2000);
+refreshStatus();
 </script>
 </body>
 </html>

@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from flask import (
     Flask,
+    Response,
     abort,
     redirect,
     render_template,
@@ -28,6 +30,8 @@ from flask import (
     send_from_directory,
     url_for,
 )
+
+from frame_bus import STAGE_KEYS
 
 from config import (
     DEFAULT_WEB_HOST,
@@ -121,7 +125,16 @@ class FlaskServer:
             self._app = app
             self._thread = threading.Thread(
                 target=app.run,
-                kwargs={"host": self.host, "port": self.port, "debug": False, "use_reloader": False},
+                kwargs={
+                    "host": self.host,
+                    "port": self.port,
+                    "debug": False,
+                    "use_reloader": False,
+                    # ``threaded=True`` is REQUIRED: the live MJPEG streams hold
+                    # their connections open indefinitely, so a single-threaded
+                    # dev server would block every other request behind them.
+                    "threaded": True,
+                },
                 daemon=True,
                 name="doc-scanner-flask",
             )
@@ -240,6 +253,81 @@ class FlaskServer:
             self.session.request_quit()
             return {"ok": True, "last_message": self.session.last_message}
 
+        @app.route("/capture", methods=["POST"])
+        def capture_view():
+            """Manually capture the current frame (the browser's ``C`` key)."""
+            ok, msg = self.session.capture_page()
+            return {
+                "ok": bool(ok),
+                "message": msg,
+                "session_pages": self.session.page_count(),
+                "last_message": self.session.last_message,
+            }
+
+        # ------------------------------------------------------------------ #
+        # Live pipeline streaming.  The main camera loop publishes every stage
+        # to ``session.frame_bus``; these endpoints just encode the latest one.
+        # ------------------------------------------------------------------ #
+        def _valid_stage(stage: str) -> bool:
+            return stage in STAGE_KEYS
+
+        def _clamp_width(raw) -> Optional[int]:
+            try:
+                w = int(raw)
+            except (TypeError, ValueError):
+                return None
+            return max(64, min(1920, w)) if w > 0 else None
+
+        @app.route("/frame/<stage>.jpg")
+        def frame_snapshot(stage: str):
+            """Single JPEG snapshot of one pipeline stage (thumbnails / fallback)."""
+            if not _valid_stage(stage):
+                abort(404, f"unknown stage {stage!r}")
+            max_w = _clamp_width(request.args.get("w"))
+            data = self.session.frame_bus.encode_jpeg(
+                stage, quality=80, max_w=max_w, min_interval=0.0
+            )
+            return Response(data, mimetype="image/jpeg")
+
+        @app.route("/stream/<stage>")
+        def stream_stage(stage: str):
+            """MJPEG (multipart/x-mixed-replace) live stream of one stage."""
+            if not _valid_stage(stage):
+                abort(404, f"unknown stage {stage!r}")
+            max_w = _clamp_width(request.args.get("w"))
+            bus = self.session.frame_bus
+            # The static "last captured" panel changes only on capture, so it
+            # streams slowly to save CPU; the live stages run ~12 fps.
+            interval = 0.5 if stage == "last_captured" else 0.08
+
+            def generate():
+                boundary = b"--frame\r\n"
+                while True:
+                    try:
+                        data = bus.encode_jpeg(
+                            stage, quality=70, max_w=max_w,
+                            min_interval=interval,
+                        )
+                        yield (
+                            boundary
+                            + b"Content-Type: image/jpeg\r\n"
+                            + f"Content-Length: {len(data)}\r\n\r\n".encode()
+                            + data
+                            + b"\r\n"
+                        )
+                        time.sleep(interval)
+                    except GeneratorExit:  # client disconnected
+                        break
+                    except Exception as exc:  # pragma: no cover - defensive
+                        logger.debug("stream %s ended: %s", stage, exc)
+                        break
+
+            return Response(
+                generate(),
+                mimetype="multipart/x-mixed-replace; boundary=frame",
+                headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+            )
+
         @app.route("/api/status")
         def api_status():
             """Lightweight JSON used by the polling loop in the UI."""
@@ -247,6 +335,7 @@ class FlaskServer:
             pdfs = _list_document_pdfs(pdf_dir)
             qrs = _list_document_qrs(qr_dir)
             latest = pdfs[-1] if pdfs else None
+            state = getattr(self.session, "state", None)
             return {
                 "session_pages": self.session.page_count(),
                 "captures": [p.name for p in captures],
@@ -257,6 +346,12 @@ class FlaskServer:
                     "pdf": latest[1].name if latest else None,
                 },
                 "last_message": getattr(self.session, "last_message", None),
+                "scan_mode": getattr(self.session, "scan_mode", None),
+                "state": state.value if hasattr(state, "value") else str(state),
+                "auto_capture_phase": getattr(
+                    self.session, "_auto_capture_phase", None
+                ),
+                "stages": list(STAGE_KEYS),
             }
 
         return app

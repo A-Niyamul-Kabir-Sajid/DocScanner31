@@ -72,24 +72,74 @@ screen is shown in the footer hint text.
 | **Confirm new** | `N` / `Esc` | Cancel the new-session request and return to **Camera** with the pages intact.       |
 | **Confirm new** | any other | Ignored — the dialog waits for an explicit Y/N choice.                                 |
 
+## Web UI — live 10-panel pipeline + remote control
+
+The Flask server now auto-starts with the app (no need to wait for the first
+`D`) and serves a **live** browser frontend at `http://<host>:5000`. Because the
+host binds to `0.0.0.0`, any phone/laptop on the same Wi-Fi can open it.
+
+The page shows the **same 10 pipeline images** the desktop window renders,
+arranged as **5 on top + 5 on bottom**:
+
+| Top row | Bottom row |
+| --- | --- |
+| Original | Selected contour |
+| Gray | Colored page doc |
+| Binary (Canny edges) | Grey page doc |
+| Contours | Black & white |
+| Present (what `C` saves) | Last captured (static) |
+
+- **Click any panel** → a popup enlarges that stage's live stream. Every other
+  panel keeps streaming and every control keeps working while the popup is open.
+- **Full remote control**: the on-page buttons (and the `C` / `D` / `X` / `N` /
+  `Q` keyboard shortcuts) drive the scanner over HTTP — capture, finish PDF,
+  delete last page, new session, quit — so you can run it entirely from a phone.
+- The desktop OpenCV window still works exactly as before; both surfaces share
+  one session (a lock keeps page numbering contiguous when both fire at once).
+
+Streaming uses browser-native MJPEG (`/stream/<stage>`, downscaled for the grid,
+full-res in the popup) plus `/frame/<stage>.jpg` snapshots — no JavaScript
+frameworks, no CDN.
+
+Run **headless** (no monitor) with `--headless`: the camera loop and web UI run,
+the OpenCV window is skipped, and the browser becomes the only interface.
+
 ## Migrating to Raspberry Pi 5 + 16 MP Camera Module
 
-1. Install the Pi OS (Bookworm) packages on the Pi:
+1. Install the Pi OS (Bookworm) system packages:
 
    ```bash
-   sudo apt update && sudo apt install -y python3-opencv python3-picamera2
-   pip3 install -r requirements.txt
+   sudo apt update
+   sudo apt install -y python3-opencv python3-picamera2 ffmpeg
    ```
 
-2. Run the scanner with the `picamera2` backend at full sensor resolution:
+2. Create the virtualenv **with system packages visible** so it can import the
+   apt-installed `picamera2` and `cv2` (this is the usual gotcha):
 
    ```bash
-   python3 app.py --backend picamera2 --width 4608 --height 2592
+   cd ~/DocumentScanner
+   python3 -m venv venv --system-site-packages
+   source venv/bin/activate
+   pip install -r requirements.txt
+   pip install pydub pyalsaaudio        # optional: MP3 audio cues on the I2S amp
    ```
 
-   `camera.py` automatically picks the picamera2 code path — no other file needs to change.
+3. Run it. The web UI auto-starts on `http://<pi-ip>:5000`.
 
-3. To run headless (no OpenCV window), comment out the `cv2.imshow` block in `app.py` and rely solely on the web UI. The Pi is often used without a display.
+   ```bash
+   # With a monitor attached (this is the command the project is driven with):
+   python3 app.py --backend picamera2 --rotate 270 --autofocus
+
+   # No monitor? Add --headless (OpenCV window skipped, web UI is the whole UI):
+   python3 app.py --backend picamera2 --rotate 270 --autofocus --headless
+   ```
+
+   `camera.py` automatically picks the picamera2 code path — no other file needs
+   to change.
+
+4. Open the UI from your phone/laptop on the same Wi-Fi. Find the Pi's address
+   with `hostname -I`, then browse to `http://<that-ip>:5000`. From there you can
+   watch the live 10-panel pipeline and capture / finish / download PDFs.
 
 ## Audio cues (Pi 5 + MAX98357A I2S amp)
 

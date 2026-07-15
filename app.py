@@ -40,6 +40,7 @@ Modal Exit dialog:
 from __future__ import annotations
 
 import argparse
+import functools
 import logging
 import os
 import sys
@@ -136,6 +137,7 @@ except ImportError:  # pragma: no cover - config is required at runtime
     DEFAULT_MP3_VOLUME_DB = 8.0
     DEFAULT_MP3_CAPTURED_FILE = "captured.mp3"
     DEFAULT_MP3_DELETED_FILE = "deleted.mp3"
+from frame_bus import LiveFrameBus
 from image_grid import stack_images
 from page_change_detector import PageChangeDetector, PageChangeEvent
 from pdf_builder import PDFBuilder, document_filename
@@ -208,6 +210,24 @@ class _LegacyMP3Shim:
 # --------------------------------------------------------------------------- #
 def _now_ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _synchronized(method):
+    """Serialise a page-mutating ScanSession method under ``_action_lock``.
+
+    The main-loop auto-capture and the Flask web endpoints both mutate the
+    in-session pages / on-disk ``page_N.jpg`` files.  Guarding capture / finish
+    / delete / new-document with one reentrant lock keeps the numbering
+    contiguous no matter which thread fires.  ``RLock`` allows
+    ``capture_current_frame`` to recurse via ``_on_page_change``.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._action_lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 def _probe_camera_url(source: object, *, timeout_s: float = 1.5) -> Optional[str]:
@@ -588,6 +608,24 @@ class ScanSession:
     _auto_capture_phase: str = field(default="off", init=False)
     _auto_capture_progress: tuple = field(default=(0, 0), init=False)
 
+    # Run the loop without the OpenCV desktop window (web-only).  Default off
+    # since the Pi 5 deployment has a monitor attached; pass ``--headless`` for
+    # a no-monitor boot.  The loop still reads the camera, ticks the FSM, and
+    # publishes frames to ``frame_bus`` for the web UI.
+    headless: bool = False
+
+    # Live-frame bus shared with the Flask UI.  The LIVE render publishes every
+    # pipeline stage here so the web endpoints can stream them without opening
+    # the camera a second time.  ``_action_lock`` serialises the page-mutating
+    # operations (capture / finish / delete / new document) so the main-loop
+    # auto-capture and web-triggered actions can't race on ``page_N.jpg``
+    # numbering.  ``RLock`` because ``capture_current_frame`` recurses via
+    # ``_on_page_change``.
+    frame_bus: LiveFrameBus = field(default_factory=LiveFrameBus, init=False)
+    _action_lock: "threading.RLock" = field(
+        default_factory=threading.RLock, init=False
+    )
+
     # ------------------------------------------------------------------ #
     def __post_init__(self) -> None:
         self.captures_dir = Path(self.captures_dir)
@@ -927,6 +965,7 @@ class ScanSession:
     # ------------------------------------------------------------------ #
     # Capture pipeline
     # ------------------------------------------------------------------ #
+    @_synchronized
     def capture_current_frame(self, frame: Optional[np.ndarray] = None) -> tuple:
         """Run the LIVE pipeline on ``frame`` (or read one from the camera).
 
@@ -1380,6 +1419,46 @@ class ScanSession:
             return 0.0
 
     # ------------------------------------------------------------------ #
+    @_synchronized
+    def capture_page(self) -> tuple:
+        """Manually capture the current frame (shared by the ``C`` key + web).
+
+        Mirrors the old inline ``C`` handler: capture the live frame, register
+        the four-point contour with the auto-capture controller so the FSM
+        parks in State 2, and play the capture cues.  Returns ``(ok, message)``
+        so the Flask ``/capture`` endpoint can report the result.
+        """
+        if self.state != ScannerState.LIVE_SCANNER_MODE:
+            self.last_message = "press N for a new document"
+            return False, self.last_message
+
+        ok, msg, _proc, _det = self.capture_current_frame()
+        self.last_message = msg
+        # Manual capture -- always succeeds as a capture, and the FSM moves
+        # into State 2.  ``register_capture`` records the new four-point
+        # contour (or clears the baseline if corners are unknown) and resets
+        # the no-match timer.
+        if ok:
+            controller = self.auto_capture
+            controller.register_capture(
+                _det.corners if _det is not None else None
+            )
+            self._auto_capture_phase = controller.phase_label()
+            self._auto_capture_progress = (
+                controller.tracker.required_frames,
+                controller.tracker.required_frames,
+            )
+            # Audio cue - same "ka-chunk" as an auto-capture fire.
+            # ``play_sound`` is MP3-first on the Pi deployment (SoundPlayer
+            # plays ``captured.mp3`` then falls back to the procedural tone
+            # if the file is missing or pydub/ffmpeg is unavailable).
+            self.play_sound("captured")
+            self.speak("capture_manual")
+        else:
+            self.speak("capture_rejected", reason=msg)
+        return ok, msg
+
+    @_synchronized
     def finish_pdf(self) -> Optional[Path]:
         """Flush ``self.pages`` into a numbered PDF and a matching QR PNG."""
         if not self.pages:
@@ -1440,6 +1519,7 @@ class ScanSession:
         return pdf_path
 
     # ------------------------------------------------------------------ #
+    @_synchronized
     def start_new_document(self) -> None:
         """Close the PDF_VIEW dialog and start a fresh document."""
         self.doc_counter += 1
@@ -1483,6 +1563,7 @@ class ScanSession:
         return pages
 
     # ------------------------------------------------------------------ #
+    @_synchronized
     def delete_last_page(self) -> bool:
         """Drop the most recently captured page from the in-session buffer.
 
@@ -1629,33 +1710,7 @@ class ScanSession:
     # ------------------------------------------------------------------ #
     def _handle_live_key(self, ch: str) -> None:
         if ch == "c":
-            ok, msg, _proc, _det = self.capture_current_frame()
-            self.last_message = msg
-            # Manual capture -- always succeeds as a capture, and the
-            # FSM moves into State 2.  In State 2 the controller will
-            # only flip back to State 1 after a continuous 2 s of "no
-            # similar contour".  ``register_capture`` records the new
-            # four-point contour (or clears the baseline if corners
-            # are unknown) and resets the no-match timer.
-            if ok:
-                controller = self.auto_capture
-                controller.register_capture(
-                    _det.corners if _det is not None else None
-                )
-                self._auto_capture_phase = controller.phase_label()
-                self._auto_capture_progress = (
-                    controller.tracker.required_frames,
-                    controller.tracker.required_frames,
-                )
-                # Audio cue - same "ka-chunk" as an auto-capture fire.
-                # ``play_sound`` is MP3-first on the Pi deployment
-                # (SoundPlayer plays ``captured.mp3`` then falls
-                # back to the procedural tone if the file is
-                # missing or pydub/ffmpeg is unavailable).
-                self.play_sound("captured")
-                self.speak("capture_manual")
-            else:
-                self.speak("capture_rejected", reason=msg)
+            self.capture_page()
             return
         if ch == "d":
             if self.page_count() == 0:
@@ -1917,6 +1972,24 @@ class ScanSession:
             ) = self.processor.process_with_debug(frame)
         except Exception:
             return self._render_live_fallback(frame)
+
+        # Publish every stage to the live-frame bus so the web UI can stream
+        # the exact same 10 images the desktop grid shows, without opening the
+        # camera a second time.  ``last_captured`` is the most recent saved
+        # page (static until the next capture).  ``None`` warp stages fall
+        # back to a placeholder inside the bus.
+        self.frame_bus.publish_many({
+            "original": frame,
+            "gray": _to_bgr(gray),
+            "binary": _to_bgr(edges),
+            "contours": contour_overlay,
+            "present": processed,
+            "selected": biggest_overlay,
+            "page_color": warped_bgr,
+            "page_gray": warped_gray_bgr,
+            "page_bw": adaptive_bgr,
+            "last_captured": self.pages[-1] if self.pages else None,
+        })
 
         # Build the 8-panel debug grid.  Stages that are unavailable
         # (no quad found => no warp) are filled with black tiles so the
@@ -2413,6 +2486,22 @@ class ScanSession:
     # ------------------------------------------------------------------ #
     def run(self) -> None:
         """Open the camera and pump the FSM until quit."""
+        # Start the web UI up-front (not only on the first ``D``) so the live
+        # 10-panel board + remote controls are reachable the moment the app
+        # boots.  ``--no-web`` swaps in a no-op stub in ``main`` so this is a
+        # cheap call in that case.
+        try:
+            self.flask_server.ensure_running()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("web UI failed to start: %s", exc)
+
+        # Headless (``--headless``): no OpenCV window.  The loop still reads the
+        # camera, ticks the FSM, and publishes frames to the bus so the web UI
+        # is the whole interface.  There is no keyboard in this mode.
+        if self.headless:
+            self._run_headless()
+            return
+
         cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_NORMAL)
 
         # Decide window mode.  The desktop users overwhelmingly prefer a
@@ -2470,6 +2559,31 @@ class ScanSession:
                     break
                 if key != 255:
                     self.handle_key(key)
+        finally:
+            self.shutdown()
+
+    # ------------------------------------------------------------------ #
+    def _run_headless(self) -> None:
+        """Window-less main loop for a no-monitor boot (``--headless``).
+
+        Reads the camera, ticks auto-capture, and calls ``render()`` purely to
+        publish the pipeline stages to ``frame_bus`` for the web UI.  All
+        control (capture / finish / delete / new / quit) comes in over HTTP.
+        """
+        logger.info("Running headless — control the scanner from the web UI.")
+        try:
+            while not self.quit_requested:
+                self._ensure_camera_alive()
+                if (
+                    self.auto_capture_enabled
+                    and self.state == ScannerState.LIVE_SCANNER_MODE
+                    and not self.show_exit_modal
+                ):
+                    self._maybe_auto_capture()
+                # render() publishes to frame_bus as a side effect; we discard
+                # the canvas since there is no window to show it in.
+                self.render()
+                time.sleep(0.03)
         finally:
             self.shutdown()
 
@@ -2592,6 +2706,13 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
                    help=("Force windowed (resizable) mode.  This is the "
                          "default; the flag exists for symmetry with "
                          "--fullscreen."))
+    p.add_argument("--headless", dest="headless", action="store_true",
+                   default=False,
+                   help=("Run without the OpenCV desktop window (no display "
+                         "needed).  The camera loop still runs and streams to "
+                         "the web UI at http://<host>:<port>, which becomes the "
+                         "only control surface.  Use on a Pi 5 booted without a "
+                         "monitor."))
     p.add_argument("--no-quality-gate", action="store_true",
                    help="Bypass the QualityGate (useful for tuning the detector).")
     p.add_argument("--blur-min", type=float, default=None,
@@ -2713,6 +2834,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         web_port=args.port,
         scan_mode=args.scan_mode,
         window_fullscreen=bool(args.fullscreen),
+        headless=bool(getattr(args, "headless", False)),
     )
 
     if args.no_quality_gate:
