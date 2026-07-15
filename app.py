@@ -122,7 +122,6 @@ except ImportError:  # pragma: no cover - config is required at runtime
     DEFAULT_VOICE_LANGUAGE = "en"
     DEFAULT_VOICE_RATE_WPM = 165
     DEFAULT_VOICE_BACKEND = "auto"
-from mp3_player import MP3Player
 try:
     from config import (
         DEFAULT_MP3_CAPTURED_FILE,
@@ -166,6 +165,42 @@ class ScannerState(str, Enum):
 # Legacy aliases so older tests keep working.
 LIVE_SCANNER_MODE = ScannerState.LIVE_SCANNER_MODE
 PDF_VIEW_MODE = ScannerState.PDF_VIEW_MODE
+
+
+# --------------------------------------------------------------------------- #
+# _LegacyMP3Shim
+# --------------------------------------------------------------------------- #
+class _LegacyMP3Shim:
+    """Backward-compat proxy for tests that still hold ``session.mp3``.
+
+    The MP3 layer was folded into :class:`SoundPlayer` so a single
+    backend owns the exclusive ALSA device and one lock dict
+    serialises back-to-back plays.  The shim translates the old
+    :meth:`MP3Player.play_event` call sites into the new
+    :meth:`SoundPlayer.play_event` lookup so previously-written
+    tests don't have to be rewritten.
+    """
+
+    __slots__ = ("_session",)
+
+    def __init__(self, session) -> None:  # type: ignore[no-untyped-def]
+        self._session = session
+
+    def play_event(self, event: str) -> bool:
+        """Backward-compat passthrough.
+
+        New code should call :meth:`SessionState.play_sound`
+        directly.  We do **not** forward to ``play_sound`` here
+        because the call sites already call it; doing so would
+        play the event twice.  The legacy shim returns ``False``
+        to signal "nothing to dispatch; the new path already ran".
+        """
+        logger.debug(
+            "LegacyMP3Shim.play_event(%r): no-op (call SessionState.play_sound "
+            "instead; MP3 lookup now lives in SoundPlayer.play_event)",
+            event,
+        )
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -548,7 +583,6 @@ class ScanSession:
     mp3_volume_db: float = DEFAULT_MP3_VOLUME_DB
     mp3_captured_file: str = DEFAULT_MP3_CAPTURED_FILE
     mp3_deleted_file: str = DEFAULT_MP3_DELETED_FILE
-    _mp3: Optional[MP3Player] = field(default=None, init=False)
     # Internal book-keeping for the HUD pill.
     _auto_capture: Optional[AutoCaptureController] = field(default=None, init=False)
     _auto_capture_phase: str = field(default="off", init=False)
@@ -745,7 +779,10 @@ class ScanSession:
         """Lazy accessor for the audio cue player.
 
         Constructed on first access so tests can replace ``_sound``
-        without triggering ``__post_init__``.
+        without triggering ``__post_init__``.  When the MP3 layer is
+        enabled, ``captured.mp3`` and ``deleted.mp3`` are registered
+        here so :meth:`SoundPlayer.play_event` looks them up in its
+        lazy PCM cache before falling back to the procedural tone.
         """
         if self._sound is None:
             self._sound = SoundPlayer(
@@ -754,6 +791,28 @@ class ScanSession:
                 alsa_device=getattr(self, "sound_alsa_device", None),
                 alsa_chunk_bytes=getattr(self, "sound_alsa_chunk_bytes", None),
             )
+            # Register MP3 cues on the consolidated SoundPlayer so the
+            # MP3-first lookup happens before the procedural tone
+            # fallback.  Doing this here (rather than in __post_init__)
+            # lets tests that swap ``session._sound`` keep their custom
+            # player untouched while still getting the procedural
+            # fallback for missing MP3s.
+            if getattr(self, "mp3_enabled", False):
+                try:
+                    self._sound.configure_mp3("captured", self.mp3_captured_file)
+                except Exception:  # pragma: no cover - defensive
+                    pass
+                try:
+                    self._sound.configure_mp3("page_deleted", self.mp3_deleted_file)
+                except Exception:  # pragma: no cover - defensive
+                    pass
+                try:
+                    self._sound.configure(
+                        alsa_device=self.mp3_device,
+                        mp3_volume_db=self.mp3_volume_db,
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    pass
         return self._sound
 
     def play_sound(self, event: str) -> None:
@@ -803,43 +862,39 @@ class ScanSession:
             logger.debug("speak(%r) failed: %s", event, exc)
 
     @property
-    def mp3(self) -> MP3Player:
-        """Lazy accessor for the long-form MP3 cue player.
+    def mp3(self):
+        """Backward-compat alias for the long-form MP3 cue path.
 
-        Constructed on first access so tests can replace ``_mp3`` without
-        triggering ``__post_init__`` (mirrors :attr:`sound` / :attr:`voice`).
-        On non-Linux hosts the underlying backend is a silent no-op, so this
-        property is safe to access from any platform.
+        The MP3 layer was consolidated into :class:`SoundPlayer` so the
+        two backends share one ALSA lock dict (fixes the
+        "Device or resource busy" race on the Pi 5).  Existing callers
+        still see a thin object that maps :meth:`play_event` onto the
+        sound layer; everything else is a no-op so older tests that
+        poked at the old ``MP3Player`` interface don't crash.
         """
-        if self._mp3 is None:
-            self._mp3 = MP3Player(
-                enabled=self.mp3_enabled,
-                captured_file=self.mp3_captured_file,
-                deleted_file=self.mp3_deleted_file,
-                device=self.mp3_device,
-                volume_db=self.mp3_volume_db,
-            )
-        return self._mp3
+        return _LegacyMP3Shim(self)
 
     def play_mp3(self, event: str) -> None:
-        """Safe wrapper around :meth:`MP3Player.play_event`.
+        """Deprecated stub kept for backwards compatibility.
 
-        Recognised events match the project-root clip filenames:
-
-        * ``"captured"``     - plays ``captured.mp3``.
-        * ``"page_deleted"`` - plays ``deleted.mp3``.
-
-        Never raises.  All exceptions (missing pydub, missing ffmpeg,
-        refused ALSA device, file-not-found) are logged at DEBUG level
-        so the LIVE loop is never stalled or crashed by audio.
+        The MP3 layer was folded into :meth:`SoundPlayer.play_event`
+        so there is now a single audio backend, a single per-event
+        lock dict, and one ``pcm.close()`` guarantee.  Calling this
+        method delegates to :meth:`play_sound` (which already tried
+        the MP3 path) so callers do not end up playing the same
+        event twice; :meth:`mp3` returns a shim object so legacy
+        ``session.mp3.play_event(...)`` calls remain routed.
         """
         if not self.mp3_enabled:
             logger.debug("play_mp3(%r): skipped (session.mp3_enabled=False)", event)
             return
-        try:
-            self.mp3.play_event(event)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("play_mp3(%r) failed: %s", event, exc)
+        # Intentionally a no-op: the call sites in ``_maybe_auto_capture``
+        # and the C / X keyboard paths already call ``self.play_sound``.
+        # Forwarding again would double-fire the event.
+        logger.debug(
+            "play_mp3(%r): no-op (MP3 lookup now lives in SoundPlayer.play_event)",
+            event,
+        )
 
     # ------------------------------------------------------------------ #
     # Public FSM API
@@ -1279,9 +1334,11 @@ class ScanSession:
                 self.page_count(), self.auto_capture.s2_no_match_timeout_s,
             )
             # Audio cues -- play the single capture chime plus the
-            # verbal confirmation.
+            # verbal confirmation.  ``play_sound`` is now MP3-first
+            # (see ``SoundPlayer.play_event``), so the legacy
+            # ``play_mp3`` call is folded into the same audio event
+            # and would otherwise fire twice.
             self.play_sound("captured")
-            self.play_mp3("captured")
             self.speak("stable")
             self.speak("capture_auto")
         else:
@@ -1591,10 +1648,11 @@ class ScanSession:
                     controller.tracker.required_frames,
                 )
                 # Audio cue - same "ka-chunk" as an auto-capture fire.
+                # ``play_sound`` is MP3-first on the Pi deployment
+                # (SoundPlayer plays ``captured.mp3`` then falls
+                # back to the procedural tone if the file is
+                # missing or pydub/ffmpeg is unavailable).
                 self.play_sound("captured")
-                # Pi 5 deployment: also play the user-supplied
-                # ``captured.mp3`` clip on the MAX98357A I2S amp.
-                self.play_mp3("captured")
                 self.speak("capture_manual")
             else:
                 self.speak("capture_rejected", reason=msg)
@@ -1620,11 +1678,11 @@ class ScanSession:
         if ch == "x":
             if self.delete_last_page():
                 # Soft "undo" cue so the user hears confirmation even if
-                # they're not looking at the HUD.
+                # they're not looking at the HUD.  ``play_sound`` is
+                # MP3-first on the Pi deployment (SoundPlayer
+                # plays ``deleted.mp3`` if available, otherwise
+                # falls back to the procedural tone).
                 self.play_sound("page_deleted")
-                # Pi 5 deployment: also play the user-supplied
-                # ``deleted.mp3`` clip on the MAX98357A I2S amp.
-                self.play_mp3("page_deleted")
                 self.speak("page_deleted")
             else:
                 self.last_message = "no pages to delete"

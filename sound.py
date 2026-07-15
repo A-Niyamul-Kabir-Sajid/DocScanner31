@@ -40,7 +40,7 @@ import sys
 import tempfile
 import threading
 import wave
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -238,6 +238,27 @@ class SoundPlayer:
         # Scratch files written on demand for non-canned WAVs (e.g. TTS
         # phrases from ``voice.py``).  Cleaned up in ``close``.
         self._scratch: list = []
+        # MP3 file registration + lazy PCM cache.
+        # ``_mp3_files`` maps event_name -> absolute path.  When a file
+        # is registered for an event, ``play_event`` will decode it to
+        # raw S16_LE/mono PCM bytes on the first press and stash the
+        # result in ``_pcm_cache``.  Subsequent presses reuse the
+        # cached bytes -- no re-decode latency on the LIVE hot path.
+        # The cache stores ``(sample_rate, pcm_bytes)`` tuples because
+        # the ALSA dispatcher needs to know the sample rate to open the
+        # PCM handle (``pcm.setrate(...)``).
+        self._mp3_files: Dict[str, str] = {}
+        self._pcm_cache: Dict[str, Tuple[int, bytes]] = {}
+        self._pcm_cache_lock = threading.Lock()
+        # MP3 decode tuning.  Mirrors the canonical Pi 5 pipeline from
+        # ``mp3_player.play_clip`` so the user's existing captured.mp3 /
+        # deleted.mp3 files play unchanged.
+        self._mp3_sample_rate: int = 48000  # Hz, MAX98357A DAC rate
+        self._mp3_channels: int = 1         # mono amplifier
+        self._mp3_volume_db: float = 0.0    # no boost by default
+        # Per-event "warned once" set for missing MP3 files.  Mirrors
+        # ``MP3Player._missing_warned`` so the LIVE log doesn't fill up.
+        self._mp3_missing_warned: set = set()
         if self._backend_name == "winsound" and self.enabled:
             self._write_wav_files()
         if self.enabled:
@@ -306,7 +327,8 @@ class SoundPlayer:
     def configure(self, *, enabled: Optional[bool] = None,
                   volume: Optional[float] = None,
                   alsa_device: Optional[str] = None,
-                  alsa_chunk_bytes: Optional[int] = None) -> None:
+                  alsa_chunk_bytes: Optional[int] = None,
+                  mp3_volume_db: Optional[float] = None) -> None:
         """Toggle enable/volume at runtime. Re-renders WAVs on volume change."""
         if enabled is not None:
             self.enabled = bool(enabled)
@@ -324,6 +346,107 @@ class SoundPlayer:
             self.alsa_device = str(alsa_device)
         if alsa_chunk_bytes is not None:
             self.alsa_chunk_bytes = int(alsa_chunk_bytes)
+        if mp3_volume_db is not None:
+            # Volume change invalidates the cached PCM bytes (they
+            # already have the old gain baked in).
+            self._mp3_volume_db = float(mp3_volume_db)
+            with self._pcm_cache_lock:
+                self._pcm_cache.clear()
+
+    def configure_mp3(self, event: str, path: Optional[str]) -> None:
+        """Register (or clear) an MP3 file path for ``event``.
+
+        Setting ``path=None`` clears the registration.  An empty
+        string is rejected as a programming error.
+
+        Once a path is registered, :meth:`play_event` will:
+
+        1. On the first call, decode the MP3 to raw S16_LE/mono PCM
+           bytes (one-shot ``pydub`` decode) and cache the result.
+        2. On every subsequent call, reuse the cached PCM directly --
+           no per-press decode latency, no ffmpeg subprocess.
+        3. If the file is missing, pydub/ffmpeg is unavailable, or the
+           decode errors out, fall through to the procedural tone so
+           the LIVE loop never goes silent.
+        """
+        if path is None:
+            self._mp3_files.pop(event, None)
+            with self._pcm_cache_lock:
+                self._pcm_cache.pop(event, None)
+            return
+        if not path:
+            raise ValueError("configure_mp3: path must be a non-empty string")
+        self._mp3_files[event] = str(path)
+        # New file -> invalidate any cached PCM for this event.
+        with self._pcm_cache_lock:
+            self._pcm_cache.pop(event, None)
+
+    def _decode_mp3_to_pcm(self, event: str, path: str) -> Optional[Tuple[int, bytes]]:
+        """Decode ``path`` to ``(sample_rate, pcm_bytes)`` S16_LE/mono.
+
+        Returns ``None`` on any failure -- callers must fall back to
+        the procedural tone in that case.
+        """
+        try:
+            from pydub import AudioSegment  # type: ignore[import-not-found]
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("mp3 decode for %r skipped (pydub unavailable): %s",
+                         event, exc)
+            return None
+        try:
+            seg = AudioSegment.from_mp3(path)
+        except Exception as exc:
+            logger.debug("mp3 decode for %r failed (%s): %s",
+                         event, path, exc)
+            return None
+        try:
+            seg = seg.set_channels(self._mp3_channels)
+            seg = seg.set_sample_width(2)  # 16-bit = S16_LE
+            if self._mp3_volume_db:
+                seg = seg + self._mp3_volume_db
+            return (seg.frame_rate, bytes(seg.raw_data))
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("mp3 reformat for %r failed: %s", event, exc)
+            return None
+
+    def _ensure_mp3_pcm(self, event: str) -> Optional[Tuple[int, bytes]]:
+        """Return cached PCM for ``event``, decoding on first miss.
+
+        Returns ``None`` if no MP3 is registered, the file is missing,
+        or the decode failed.  Thread-safe -- a single decode runs even
+        if two callers race for the cache slot.
+        """
+        with self._pcm_cache_lock:
+            cached = self._pcm_cache.get(event)
+        if cached is not None:
+            return cached
+        path = self._mp3_files.get(event)
+        if not path:
+            return None
+        if not os.path.exists(path):
+            # Same "warn once, stay quiet after" pattern as
+            # ``MP3Player.play_event`` so the LIVE log doesn't fill up.
+            if event not in self._mp3_missing_warned:
+                self._mp3_missing_warned.add(event)
+                logger.warning(
+                    "mp3 clip for %r not found at %s; "
+                    "falling back to procedural tone (further missing-file "
+                    "logs will stay at DEBUG)", event, path,
+                )
+            else:
+                logger.debug("mp3 clip for %r missing: %s", event, path)
+            return None
+        decoded = self._decode_mp3_to_pcm(event, path)
+        if decoded is None:
+            return None
+        # Re-check the cache under the lock -- another thread may have
+        # raced ahead and filled it while our decode was running.
+        with self._pcm_cache_lock:
+            existing = self._pcm_cache.get(event)
+            if existing is not None:
+                return existing
+            self._pcm_cache[event] = decoded
+            return decoded
 
     def _cleanup_files(self) -> None:
         """Delete any temp WAVs previously written for winsound playback."""
@@ -347,16 +470,41 @@ class SoundPlayer:
 
     # ------------------------------------------------------------------ #
     def play_event(self, name: str) -> bool:
-        """Play the named event's WAV. Returns True if dispatched."""
+        """Play the named event. Returns True if dispatched.
+
+        Lookup order:
+
+        1. **MP3 cache** -- if an MP3 file was registered via
+           :meth:`configure_mp3` for ``name`` and the decode produced
+           cached PCM, play that.  This is the user-supplied long-form
+           audio path (e.g. ``captured.mp3`` on the Pi 5 deployment).
+        2. **Procedural tone** -- the built-in short WAV previously
+           synthesised at construction time.  This is the fallback so
+           audio is always heard even when MP3 is misconfigured.
+        """
         if not self.enabled:
             logger.debug("play_event(%r): skipped (SoundPlayer disabled)", name)
             return False
+        # MP3-first lookup.  If a file is registered and decodes
+        # successfully, play it.  The dispatch goes through the same
+        # ALSA backend + per-event lock + pcm.close() machinery as the
+        # procedural tone path, so the two layers never race for
+        # ``plughw:2,0``.
+        pcm = self._ensure_mp3_pcm(name)
+        if pcm is not None:
+            sample_rate, raw = pcm
+            rc = self._play_pcm(raw, sample_rate=sample_rate,
+                                event_name=name)
+            logger.info("play_event(%r) -> %s (backend=%s, source=mp3, "
+                        "rate=%d, bytes=%d)",
+                        name, rc, self._backend_name, sample_rate, len(raw))
+            return rc
         wav = self._cache.get(name)
         if wav is None:
             logger.debug("play_event(%r): unknown event, ignoring", name)
             return False
         rc = self._play_wav(wav, event_name=name)
-        logger.info("play_event(%r) -> %s (backend=%s, volume=%.2f)",
+        logger.info("play_event(%r) -> %s (backend=%s, source=tone, volume=%.2f)",
                     name, rc, self._backend_name, self.volume)
         return rc
 
@@ -507,6 +655,178 @@ class SoundPlayer:
                 return True
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("sound backend %s failed: %s", name, exc)
+            return False
+        # No backend available - silent no-op.
+        return False
+
+    # ------------------------------------------------------------------ #
+    def _play_pcm(self, raw: bytes, *, sample_rate: int,
+                  event_name: Optional[str] = None) -> bool:
+        """Play pre-decoded S16_LE mono PCM ``raw`` to the active backend.
+
+        This is the consolidation point that lets ``play_event`` play
+        either the procedural tone or a user-supplied MP3 clip from a
+        single dispatch path.  The byte layout is identical regardless
+        of source -- the existing ``_play_wav`` ALSA branch already
+        downmixes the synth WAV to S16_LE / mono, so reusing its lock
+        + pcm.close() plumbing keeps the two layers from racing for
+        ``plughw:2,0``.
+
+        Parameters
+        ----------
+        raw:
+            Raw PCM bytes (16-bit signed little-endian, mono).
+        sample_rate:
+            Frame rate of ``raw`` in Hz.  Required so the ALSA backend
+            can call ``pcm.setrate(...)`` correctly; ignored by the
+            winsound backend (which rebuilds a WAV header around the
+            bytes via :func:`wave`).
+        event_name:
+            Used to look up the per-event playback lock so back-to-back
+            MP3 + tone plays serialise instead of colliding on the
+            exclusive ALSA device.  ``None`` falls back to a shared
+            scratch lock (TTS-style calls).
+
+        Returns
+        -------
+        bool
+            ``True`` if dispatch was accepted (``False`` means no
+            usable backend or the call was a silent no-op).
+        """
+        if not raw:
+            logger.debug("_play_pcm(%r): empty buffer, nothing to play", event_name)
+            return False
+        name, backend = self._backend_name, self._backend
+        try:
+            if name == "winsound" and backend is not None:
+                # Wrap the raw PCM in a WAV header so winsound (which
+                # only accepts WAV files) can play it.  The temp file
+                # is tracked via ``self._scratch`` and swept in
+                # ``close``.
+                fd, path = tempfile.mkstemp(
+                    prefix="docscan_pcm_", suffix=".wav",
+                )
+                scratch_path = path
+                try:
+                    with os.fdopen(fd, "wb") as f:
+                        # 1ch, 2 bytes/sample, 48 kHz (or whatever the
+                        # decoder produced) -> 44-byte RIFF/WAVE header
+                        # followed by the raw PCM bytes.
+                        nchannels = 1
+                        sampwidth = 2
+                        with wave.open(f, "wb") as wf:
+                            wf.setnchannels(nchannels)
+                            wf.setsampwidth(sampwidth)
+                            wf.setframerate(int(sample_rate))
+                            wf.writeframes(raw)
+                except Exception:
+                    scratch_path = None
+                    raise
+                self._scratch.append(scratch_path)
+                flags = (
+                    backend.SND_FILENAME
+                    | backend.SND_ASYNC
+                    | getattr(backend, "SND_NODEFAULT", 0)
+                )
+                backend.PlaySound(scratch_path, flags)
+                return True
+            if name == "cli" and backend is not None:
+                argv = list(backend)
+                # Same shape as the WAV CLI path: write a real file
+                # (CLI players don't read raw PCM from stdin), fire
+                # ``Popen``, and let the OS clean up the temp file
+                # when the player exits.
+                def _run_and_cleanup(pcm_data: bytes = raw,
+                                     rate: int = sample_rate) -> None:
+                    fd, path = tempfile.mkstemp(suffix=".wav")
+                    try:
+                        with os.fdopen(fd, "wb") as f:
+                            with wave.open(f, "wb") as wf:
+                                wf.setnchannels(1)
+                                wf.setsampwidth(2)
+                                wf.setframerate(int(rate))
+                                wf.writeframes(pcm_data)
+                        subprocess.Popen(
+                            argv + [path],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    except Exception as exc:  # pragma: no cover - def.
+                        logger.debug("cli pcm playback failed: %s", exc)
+                        try:
+                            os.unlink(path)
+                        except OSError:
+                            pass
+                threading.Thread(
+                    target=_run_and_cleanup, daemon=True,
+                ).start()
+                return True
+            if name == "alsa" and backend == "alsa":
+                # Same per-event lock + pcm.close() guarantee as the
+                # WAV path, but the bytes are already decoded so we
+                # skip the pydub round-trip.  This is the fix for the
+                # "Device or resource busy" race that existed when
+                # ``SoundPlayer`` and ``MP3Player`` each opened their
+                # own ``alsaaudio.PCM`` handle for the same
+                # ``plughw:2,0`` device.
+                lock = self._play_locks.get(event_name or "") if event_name else None
+                if lock is None:
+                    lock = getattr(self, "_scratch_lock", None)
+                    if lock is None:
+                        self._scratch_lock = threading.Lock()
+                        lock = self._scratch_lock
+                if not lock.acquire(blocking=False):
+                    logger.debug(
+                        "alsa pcm playback for %r: previous clip still "
+                        "playing, dropping (matches tone/MP3 policy)",
+                        event_name,
+                    )
+                    return True
+                device = self.alsa_device
+                chunk_bytes = self.alsa_chunk_bytes
+                captured_lock = lock
+                rate = int(sample_rate)
+
+                def _run_alsa_pcm(pcm_data: bytes = raw,
+                                  dev: str = device,
+                                  chunk: int = chunk_bytes,
+                                  lk: threading.Lock = captured_lock,
+                                  rate_hz: int = rate) -> None:
+                    pcm = None
+                    try:
+                        import alsaaudio  # type: ignore[import-not-found]
+                        pcm = alsaaudio.PCM(device=dev,
+                                            mode=alsaaudio.PCM_NORMAL)
+                        pcm.setchannels(1)
+                        pcm.setrate(rate_hz)
+                        pcm.setformat(alsaaudio.PCM_FORMAT_S16_LE)
+                        pcm.setperiodsize(chunk)
+                        for off in range(0, len(pcm_data), chunk):
+                            pcm.write(pcm_data[off:off + chunk])
+                    except Exception as exc:  # pragma: no cover - defensive
+                        logger.debug("alsa pcm playback failed: %s", exc)
+                    finally:
+                        # Release the PCM handle BEFORE the lock so the
+                        # next play_event() can grab plughw:2,0 without
+                        # "Device or resource busy".  Closing an
+                        # already-closed PCM is a no-op in pyalsaaudio.
+                        if pcm is not None:
+                            try:
+                                pcm.close()
+                            except Exception:
+                                pass
+                        try:
+                            lk.release()
+                        except Exception:
+                            pass
+
+                threading.Thread(
+                    target=_run_alsa_pcm, daemon=True,
+                    name=f"sound-alsa-pcm-{event_name or 'pcm'}",
+                ).start()
+                return True
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("pcm backend %s failed: %s", name, exc)
             return False
         # No backend available - silent no-op.
         return False
