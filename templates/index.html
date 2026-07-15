@@ -159,6 +159,37 @@
             width: 34px; height: 34px; border-radius: 8px; cursor: pointer; font-size: 18px; line-height: 1;
         }
 
+        /* ---------- "Document saved" popup ---------- */
+        /* Above the panel-zoom modal, so a tile left open can't hide it. */
+        #pdfModal { z-index: 110; }
+        .pdf-saved {
+            display: flex; gap: 22px; padding: 20px 22px; align-items: center;
+            flex-wrap: wrap;
+        }
+        .pdf-info { flex: 1; min-width: 240px; }
+        .pdf-name {
+            font-size: 20px; font-weight: 700; color: var(--ok);
+            word-break: break-all;
+        }
+        .pdf-link {
+            display: inline-block; margin-top: 12px; padding: 9px 14px;
+            border: 1px solid var(--line); border-radius: 10px;
+            background: var(--bg-2); font-weight: 600;
+        }
+        .pdf-link:hover { background: #243169; text-decoration: none; }
+        .pdf-qr {
+            display: flex; flex-direction: column; gap: 8px; align-items: center;
+        }
+        .pdf-qr img {
+            width: 200px; height: 200px; object-fit: contain;
+            background: #fff; padding: 8px; border-radius: 12px;
+            border: 2px solid var(--brand);
+        }
+        @media (max-width: 560px) {
+            .pdf-saved { flex-direction: column; align-items: stretch; }
+            .pdf-qr img { width: 160px; height: 160px; align-self: center; }
+        }
+
         /* ---------- gallery / saved PDFs ---------- */
         details.gallery-wrap { margin-top: 22px; }
         details.gallery-wrap > summary {
@@ -266,6 +297,36 @@
     </div>
 </div>
 
+<!-- "Document saved" popup — mirrors the desktop PDF_VIEW screen.
+     Driven by /api/status.state, so pressing D on the Pi opens it here too,
+     and pressing N on the Pi closes it here.  N is the only way out. -->
+<div class="modal" id="pdfModal" aria-hidden="true">
+    <div class="modal-inner">
+        <div class="modal-head">
+            <h3>Document saved</h3>
+            <div class="grow"></div>
+            <span class="pill ok" id="pdfDocPill">#000</span>
+        </div>
+        <div class="pdf-saved">
+            <div class="pdf-info">
+                <div class="pdf-name" id="pdfDocName">—</div>
+                <div class="muted" id="pdfDocPages">—</div>
+                <p class="muted" style="margin:10px 0 0">
+                    Scan the QR code or open the link on your phone.
+                </p>
+                <a id="pdfDocLink" class="pdf-link" href="#" download>⇣ Download PDF</a>
+                <button id="pdfNewBtn" class="primary" style="margin-top:14px">
+                    Start new session <kbd>N</kbd>
+                </button>
+            </div>
+            <div class="pdf-qr">
+                <img id="pdfDocQr" alt="QR code linking to this PDF">
+                <div class="muted" style="font-size:12px;text-align:center">Point your phone here</div>
+            </div>
+        </div>
+    </div>
+</div>
+
 <div class="toast-wrap" id="toasts" aria-live="polite"></div>
 
 <script>
@@ -338,6 +399,48 @@ function closeModal() {
 $("#modalClose").onclick = closeModal;
 modal.addEventListener("click", (e) => { if (e.target === modal) closeModal(); });
 
+/* ---------- "Document saved" popup (mirrors the desktop PDF_VIEW state) ----------
+   Opened whenever the session is in PDF_VIEW_MODE — whether D was pressed here
+   or on the Pi's keyboard — and closed only by N (start new session), matching
+   the desktop FSM.  Deliberately NOT dismissable via Esc/backdrop: the session
+   really is parked in PDF_VIEW until a new document is started. */
+const pdfModal = $("#pdfModal");
+let pdfModalNum = null;
+function openPdfModal(latest) {
+    if (!latest || !latest.num) return;
+    if (pdfModalNum !== latest.num) {
+        pdfModalNum = latest.num;
+        const id = String(latest.num).padStart(3, "0");
+        $("#pdfDocPill").textContent = "#" + id;
+        $("#pdfDocName").textContent = latest.pdf || `document_${id}.pdf`;
+        $("#pdfDocLink").href = `/pdf/${latest.num}`;
+        const qr = $("#pdfDocQr");
+        if (latest.has_qr) {
+            qr.src = `/qr/${latest.num}`;
+            qr.parentElement.style.display = "";
+        } else {
+            qr.removeAttribute("src");
+            qr.parentElement.style.display = "none";
+        }
+    }
+    // Page count arrives with the status poll; keep it fresh.
+    $("#pdfDocPages").textContent =
+        latest.pages == null ? "" :
+        (latest.pages === 1 ? "1 page inside" : latest.pages + " pages inside");
+    pdfModal.classList.add("open");
+    pdfModal.setAttribute("aria-hidden", "false");
+}
+function closePdfModal() {
+    pdfModal.classList.remove("open");
+    pdfModal.setAttribute("aria-hidden", "true");
+    pdfModalNum = null;
+}
+/* Keep the popup in sync with the real session state. */
+function syncPdfModal(s) {
+    if (s.state === "PDF_VIEW_MODE") openPdfModal(s.latest);
+    else closePdfModal();
+}
+
 /* ---------- toast ---------- */
 function toast(msg, kind = "ok", ttl = 3000) {
     const el = document.createElement("div");
@@ -397,10 +500,17 @@ $("#deleteBtn").onclick = async () => {
 };
 $("#newBtn").onclick = async () => {
     const b = $("#newBtn"); busy(b, true);
-    try { await postJSON("/new-session"); toast("New session started", "ok"); refreshStatus(); }
+    try {
+        await postJSON("/new-session");
+        toast("New session started", "ok");
+        closePdfModal();     // instant feedback; refreshStatus confirms below
+        refreshStatus();
+    }
     catch (e) { toast("New session failed: " + e.message, "err"); }
     finally { busy(b, false); }
 };
+// The popup's own button is just the N action.
+$("#pdfNewBtn").onclick = () => $("#newBtn").click();
 $("#quitBtn").onclick = async () => {
     const pages = parseInt($("#stPages").textContent || "0", 10);
     if (pages > 0) {
@@ -492,6 +602,7 @@ async function refreshStatus() {
         if (s.last_message) $("#stMsg").textContent = s.last_message;
         if (Array.isArray(s.captures)) renderCaptures(s.captures);
         if (Array.isArray(s.pdfs)) renderPdfs(s.pdfs, Array.isArray(s.qrs) ? s.qrs : []);
+        syncPdfModal(s);
     } catch (e) { /* retry next tick */ }
 }
 setInterval(refreshStatus, 2000);

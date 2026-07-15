@@ -438,6 +438,19 @@ class FlaskServer:
             qrs = _list_document_qrs(qr_dir)
             latest = pdfs[-1] if pdfs else None
             state = getattr(self.session, "state", None)
+            state_str = state.value if hasattr(state, "value") else str(state)
+
+            # Page count of the saved PDF, for the "Document saved" popup.
+            # Only computed while the UI is actually in PDF_VIEW (it re-reads
+            # the file), so the normal LIVE poll stays cheap.
+            latest_pages = None
+            if latest is not None and state_str == "PDF_VIEW_MODE":
+                try:
+                    latest_pages = self.session.page_count_for_pdf(latest[1])
+                except Exception:  # pragma: no cover - defensive
+                    latest_pages = None
+            qr_nums = {num for num, _ in qrs}
+
             return {
                 "session_pages": self.session.page_count(),
                 "captures": [p.name for p in captures],
@@ -446,10 +459,12 @@ class FlaskServer:
                 "latest": {
                     "num": latest[0] if latest else 0,
                     "pdf": latest[1].name if latest else None,
+                    "pages": latest_pages,
+                    "has_qr": bool(latest and latest[0] in qr_nums),
                 },
                 "last_message": getattr(self.session, "last_message", None),
                 "scan_mode": getattr(self.session, "scan_mode", None),
-                "state": state.value if hasattr(state, "value") else str(state),
+                "state": state_str,
                 "auto_capture_phase": getattr(
                     self.session, "_auto_capture_phase", None
                 ),
