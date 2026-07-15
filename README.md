@@ -118,8 +118,9 @@ the OpenCV window is skipped, and the browser becomes the only interface.
 
    ```bash
    cd ~/DocumentScanner
-   python3 -m venv venv --system-site-packages
+   python -m venv venv --system-site-packages   # use python3 if `python` is unset
    source venv/bin/activate
+   # after activating, `python` and `pip` point at the venv
    pip install -r requirements.txt
    pip install pydub pyalsaaudio        # optional: MP3 audio cues on the I2S amp
    ```
@@ -128,10 +129,10 @@ the OpenCV window is skipped, and the browser becomes the only interface.
 
    ```bash
    # With a monitor attached (this is the command the project is driven with):
-   python3 app.py --backend picamera2 --rotate 270 --autofocus
+   python app.py --backend picamera2 --rotate 270 --autofocus
 
    # No monitor? Add --headless (OpenCV window skipped, web UI is the whole UI):
-   python3 app.py --backend picamera2 --rotate 270 --autofocus --headless
+   python app.py --backend picamera2 --rotate 270 --autofocus --headless
    ```
 
    `camera.py` automatically picks the picamera2 code path — no other file needs

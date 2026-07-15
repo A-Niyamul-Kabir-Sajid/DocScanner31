@@ -309,17 +309,34 @@ const BOTTOM = [
     { stage: "last_captured", label: "Last captured (static)" },
 ];
 
-/* Build a tile.  Grid images use a downscaled stream (?w=480) to spare the Pi;
-   the popup opens the full-resolution stream. */
+/* Build a tile.  IMPORTANT: browsers only allow ~6 concurrent connections per
+   host, so we CANNOT hold 10 persistent MJPEG streams open — the extra ones
+   queue forever and starve /capture, /api/status and the popup.  Instead each
+   grid tile *polls* short JPEG snapshots (/frame/<stage>.jpg), which finish in
+   a few ms and free the connection immediately.  The single popped-up panel is
+   the only live MJPEG stream (1 connection). */
 function makeTile(item, n) {
     const fig = document.createElement("figure");
     fig.className = "tile";
     fig.dataset.stage = item.stage;
     fig.dataset.label = item.label;
-    fig.innerHTML =
-        `<img src="/stream/${item.stage}?w=480" alt="${item.label}">` +
-        `<figcaption><span>${item.label}</span><span class="num">${n}</span></figcaption>`;
+
+    const img = document.createElement("img");
+    img.alt = item.label;
+    const cap = document.createElement("figcaption");
+    cap.innerHTML = `<span>${item.label}</span><span class="num">${n}</span>`;
+    fig.appendChild(img);
+    fig.appendChild(cap);
     fig.addEventListener("click", () => openModal(item));
+
+    // Self-pacing snapshot loop: request the next frame only after the current
+    // one has loaded (or errored), so a tile never has more than one request
+    // in flight and the whole grid stays under the connection cap.
+    const gap = item.stage === "last_captured" ? 500 : 140;   // static panel polls slowly
+    function next() { img.src = `/frame/${item.stage}.jpg?w=480&t=${Date.now()}`; }
+    img.onload  = () => setTimeout(next, gap);
+    img.onerror = () => setTimeout(next, 800);
+    next();
     return fig;
 }
 TOP.forEach((it, i)    => $("#boardTop").appendChild(makeTile(it, i + 1)));
@@ -351,11 +368,19 @@ function toast(msg, kind = "ok", ttl = 3000) {
 }
 
 /* ---------- network ---------- */
-async function postJSON(url) {
-    const res = await fetch(url, { method: "POST" });
-    let body; try { body = await res.json(); } catch { body = {}; }
-    if (!res.ok) throw new Error(body.error || res.statusText || ("HTTP " + res.status));
-    return body;
+async function postJSON(url, timeoutMs = 8000) {
+    // Abort after a timeout so a control button can never stay stuck disabled
+    // if a request is delayed.
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+        const res = await fetch(url, { method: "POST", signal: ctrl.signal });
+        let body; try { body = await res.json(); } catch { body = {}; }
+        if (!res.ok) throw new Error(body.error || res.statusText || ("HTTP " + res.status));
+        return body;
+    } finally {
+        clearTimeout(t);
+    }
 }
 function busy(btn, on) { btn.disabled = !!on; }
 
