@@ -226,6 +226,15 @@ class SoundPlayer:
         # (raises "Cannot play asynchronously from memory").  Pre-writing
         # means the LIVE hot path is allocation-free on play_event.
         self._files: Dict[str, str] = {}
+        # Per-event "currently playing" lock for the ALSA backend.
+        # ``plughw:<card>,<dev>`` is exclusive -- two simultaneous
+        # ``alsaaudio.PCM(device=...)`` calls raise "Device or resource
+        # busy".  We use the same drop-the-burst pattern as
+        # :class:`mp3_player.MP3Player` so spamming the capture / delete
+        # keys never leaves a dangling handle blocking the next play.
+        self._play_locks: Dict[str, threading.Lock] = {
+            name: threading.Lock() for name in _EVENT_NOTES
+        }
         # Scratch files written on demand for non-canned WAVs (e.g. TTS
         # phrases from ``voice.py``).  Cleaned up in ``close``.
         self._scratch: list = []
@@ -424,12 +433,38 @@ class SoundPlayer:
                 # synthesised sample rate so the DAC gets exactly what
                 # we built.  Runs on a daemon thread so the LIVE loop
                 # never blocks on the speaker-write.
+                #
+                # ``plughw:<card>,<dev>`` is an *exclusive* ALSA device.
+                # Two simultaneous ``alsaaudio.PCM(device=...)`` calls
+                # raise "Device or resource busy", so we serialise
+                # back-to-back plays per event via ``self._play_locks``.
+                # If a previous request is still streaming we drop the
+                # new one (matches :class:`mp3_player.MP3Player`'s
+                # "drop the burst" design).
+                lock = self._play_locks.get(event_name or "") if event_name else None
+                if lock is None:
+                    # TTS / on-the-fly WAV (no canned event name): use a
+                    # shared lock so we don't trip "Device busy" either.
+                    lock = getattr(self, "_scratch_lock", None)
+                    if lock is None:
+                        self._scratch_lock = threading.Lock()
+                        lock = self._scratch_lock
+                if not lock.acquire(blocking=False):
+                    logger.debug(
+                        "alsa sound playback for %r: previous clip still "
+                        "playing, dropping (matches MP3Player policy)",
+                        event_name,
+                    )
+                    return True
                 device = self.alsa_device
                 chunk_bytes = self.alsa_chunk_bytes
+                captured_lock = lock
 
                 def _run_alsa(wav_bytes: bytes = wav,
                               dev: str = device,
-                              chunk: int = chunk_bytes) -> None:
+                              chunk: int = chunk_bytes,
+                              lk: threading.Lock = captured_lock) -> None:
+                    pcm = None
                     try:
                         import alsaaudio  # type: ignore[import-not-found]
                         from pydub import AudioSegment  # type: ignore[import-not-found]
@@ -450,6 +485,20 @@ class SoundPlayer:
                             pcm.write(raw[off:off + chunk])
                     except Exception as exc:  # pragma: no cover - defensive
                         logger.debug("alsa sound playback failed: %s", exc)
+                    finally:
+                        # Release the PCM handle BEFORE the lock so the
+                        # next play_event() can grab plughw:2,0 without
+                        # "Device or resource busy".  Closing an
+                        # already-closed PCM is a no-op in pyalsaaudio.
+                        if pcm is not None:
+                            try:
+                                pcm.close()
+                            except Exception:
+                                pass
+                        try:
+                            lk.release()
+                        except Exception:
+                            pass
 
                 threading.Thread(
                     target=_run_alsa, daemon=True,
