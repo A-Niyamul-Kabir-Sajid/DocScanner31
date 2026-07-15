@@ -1,4 +1,4 @@
-"""Smoke-test: StabilityTracker + jitter-band under realistic YOLO jitter."""
+"""Smoke-test: StabilityTracker + jitter-band under realistic detector jitter."""
 import random
 
 import numpy as np

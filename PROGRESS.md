@@ -140,8 +140,8 @@ modules.
 | Module | Responsibility |
 |--------|----------------|
 | `config.py` | `AppConfig` dataclass + idempotent directory creation (`PDF_DIR`, `QR_DIR`, `SCAN_MODE`, etc.) |
-| `document_processor.py` | 15-step pipeline (YOLO → Canny → contour → refine → warp → threshold → deskew) returning `(processed_bgr, DetectionResult)` |
-| `detector.py` | YOLOv8n primary + OpenCV contour fallback, returns a `BBox` |
+| `document_processor.py` | 15-step pipeline (ROI bbox → Canny → contour → refine → warp → threshold → deskew) returning `(processed_bgr, DetectionResult)` |
+| `detector.py` | OpenCV Canny + contour document localiser, returns a `BBox` (YOLOv8n was removed — the weights failed to load on the Pi and this path ran anyway) |
 | `corner_refiner.py` | `CornerRefiner.refine()` / `from_edges()` / `_reorder()` for sub-pixel quad ordering |
 | `quality_gate.py` | `QualityGate.evaluate()` → `QualityReport(ok, reason, blur, brightness, motion, corner_confidence, document_ratio)` |
 | `pdf_builder.py` | `PDFBuilder.build_from_paths()` + `document_filename(doc_id)` helper → `output/pdf/document_NNN.pdf` |

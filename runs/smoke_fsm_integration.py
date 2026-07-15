@@ -32,7 +32,7 @@ from document_processor import DetectionResult             # noqa: E402
 
 
 def _det(quad: np.ndarray, conf: float = 0.9) -> DetectionResult:
-    return DetectionResult(corners=quad, confidence=conf, used_yolo=False, bbox=None)
+    return DetectionResult(corners=quad, confidence=conf, bbox=None)
 
 
 def _make_session(quad: np.ndarray, processed: np.ndarray) -> ScanSession:

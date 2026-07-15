@@ -80,11 +80,13 @@ DEFAULT_WEB_HOST: str = "0.0.0.0"
 DEFAULT_WEB_PORT: int = 5000
 
 # --------------------------------------------------------------------------- #
-# Document detection (YOLOv8n + OpenCV contour fallback)
+# Document detection (OpenCV contour pass)
 # --------------------------------------------------------------------------- #
-ENABLE_YOLO: bool = True
-YOLO_MODEL_PATH: Path = PROJECT_ROOT / "yolov8n.pt"
-YOLO_CONFIDENCE: float = 0.35
+# When True, ``DocumentProcessor`` first asks ``DocumentDetector`` for a coarse
+# document bbox and refines the corners inside that ROI; if that yields nothing
+# it falls back to refining against the full-frame edge map.  Set False to skip
+# the ROI stage and always use the full-frame edge path.
+USE_ROI_DETECTOR: bool = True
 DOC_MIN_AREA_RATIO: float = 0.08          # doc must cover >= 8% of frame
 
 # --------------------------------------------------------------------------- #
@@ -138,7 +140,7 @@ DEFAULT_SOUND_ALSA_CHUNK_BYTES: int = 4096
 # User requested a 2-second stability window before auto-capture fires.
 DEFAULT_STABLE_FRAMES: int = 10  # ~2 s at the 30 ms LIVE tick
 # Maximum corner drift (pixels) tolerated between consecutive frames.
-# YOLOv8n + approxPolyDP routinely jitters 8-15 px even when the document
+# The contour + approxPolyDP pass routinely jitters 8-15 px even when the document
 # is held still, so a tight 6 px threshold never lets the streak build.
 # 18 px is comfortably above that noise floor but still below the drift
 # you get from a slow hand swap (~40+ px).
@@ -258,7 +260,7 @@ class AppConfig:
     auto_capture_enabled: bool = DEFAULT_AUTO_CAPTURE_ENABLED
     auto_capture_cooldown: float = DEFAULT_AUTO_CAPTURE_COOLDOWN
     scan_mode: str = SCAN_MODE
-    enable_yolo: bool = ENABLE_YOLO
+    use_roi_detector: bool = USE_ROI_DETECTOR
     quality_gate_enabled: bool = QUALITY_GATE_ENABLED
     shadow_removal: bool = SHADOW_REMOVAL
     sharpen: bool = SHARPEN

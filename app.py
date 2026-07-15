@@ -613,6 +613,11 @@ class ScanSession:
     _auto_capture: Optional[AutoCaptureController] = field(default=None, init=False)
     _auto_capture_phase: str = field(default="off", init=False)
     _auto_capture_progress: tuple = field(default=(0, 0), init=False)
+    # One-shot latch for the "document detected" voice cue.  MUST have a real
+    # default: ``_maybe_auto_capture`` reads it on every S1 tick but only
+    # assigns it when the quad is None, so a session whose very first tick
+    # already sees a document would otherwise die with an AttributeError.
+    _sound_detect_start_played: bool = field(default=False, init=False)
 
     # Run the loop without the OpenCV desktop window (web-only).  Default off
     # since the Pi 5 deployment has a monitor attached; pass ``--headless`` for

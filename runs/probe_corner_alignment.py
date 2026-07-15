@@ -1,8 +1,8 @@
-"""More realistic probe: page corners are *inside* the YOLO bbox with margin.
+"""More realistic probe: page corners are *inside* the ROI bbox with margin.
 
 The previous probe gave the bbox exactly at the paper edges so the bug was
-masked.  Here we shrink the paper by 60 px on each side and let YOLO return
-a bbox that hugs the paper with 20 px of padding.
+masked.  Here we shrink the paper by 60 px on each side and let the detector
+return a bbox that hugs the paper with 20 px of padding.
 """
 
 from __future__ import annotations
@@ -47,13 +47,16 @@ mask = cv2.warpPerspective(
 mask3 = cv2.merge([mask, mask, mask])
 canvas = np.where(mask3 == 1, warped, canvas)
 
-# YOLO bbox with 20 px padding around the page.
+# Coarse ROI bbox with 20 px padding around the page.
 x, y = int(gt[:, 0].min()) - 20, int(gt[:, 1].min()) - 20
 right, bottom = int(gt[:, 0].max()) + 20, int(gt[:, 1].max()) + 20
 w, h = right - x, bottom - y
 
 
-class FakeYOLO:
+class FakeDetector:
+    """Stub detector that returns a known bbox, so this probe measures the
+    corner refiner in isolation rather than the bbox search."""
+
     def __init__(self, bbox):
         self._bbox = bbox
         self.scan_mode = "color"
@@ -64,13 +67,13 @@ class FakeYOLO:
 
 proc = DocumentProcessor(
     scan_mode="color",
-    enable_yolo=True,
-    detector=FakeYOLO((x, y, w, h)),
+    use_roi_detector=True,
+    detector=FakeDetector((x, y, w, h)),
     corner_refiner=None,
 )
 
 processed, detection = proc.process(canvas)
-print(f"YOLO bbox returned:       {detection.bbox}")
+print(f"ROI bbox returned:        {detection.bbox}")
 print(f"Corners from pipeline:    {detection.corners.tolist() if detection.corners is not None else None}")
 print(f"Ground truth (frame cs):  {gt.tolist()}")
 if detection.corners is not None:

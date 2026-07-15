@@ -39,7 +39,7 @@ class StabilityTracker:
             self.stable_count += 1
         elif distance <= self.tolerance * self.jitter_band:
             # Detection jitter - keep the baseline, hold the count steady.
-            # (Without this band the count would reset on every YOLO hiccup.)
+            # (Without this band the count would reset on every detector hiccup.)
             pass
         else:
             # Real motion - start a fresh streak from this quad.

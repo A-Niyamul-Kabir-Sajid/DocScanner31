@@ -16,8 +16,10 @@ Flask>=3.0.0
 # QR code generator — embeds a download link onto the generated PDF
 qrcode>=7.4.0
 
-# Object detection model for document localization
-ultralytics>=8.0.0
+# NOTE: ``ultralytics`` (YOLOv8n) was removed.  The bundled weights failed to
+# load on the Pi and every frame fell back to the OpenCV contour detector
+# anyway, so the dependency (which drags in torch — a huge install on a
+# Raspberry Pi) bought nothing.  Document localisation is pure OpenCV now.
 
 # PDF reader — used only by the smoke tests to verify generated PDFs
 pypdf>=4.0.0 ; python_version < "3.13"

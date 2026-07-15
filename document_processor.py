@@ -9,7 +9,8 @@ Implements the spec's exact 15-step pipeline per captured page:
     5. Apply automatic Canny Edge Detection.
     6. Apply dilation followed by erosion.
     7. Detect document contour.
-    8. If YOLO is enabled: detect document first, crop ROI, refine corners with OpenCV.
+    8. If the ROI detector is enabled: find a coarse document bbox first, crop
+       the ROI, and refine the corners inside it.
     9. Reorder corner points.
    10. Apply Perspective Warp.
    11. Crop 20 pixels from borders.
@@ -35,11 +36,11 @@ from config import (
     A4_WIDTH_PX,
     DOC_BORDER_CROP_PX,
     DOC_MIN_AREA_RATIO,
-    ENABLE_YOLO,
     MAX_UPSCALE_RATIO,
     SCAN_MODE,
     SHADOW_REMOVAL,
     SHARPEN,
+    USE_ROI_DETECTOR,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,8 +57,9 @@ class DetectionResult:
 
     corners: Optional[np.ndarray]  # 4x2 int array in source-frame coordinates
     confidence: float              # 0.0 .. 1.0
-    used_yolo: bool
-    bbox: Optional[Tuple[int, int, int, int]]  # (x, y, w, h) or None
+    # Coarse document bbox the corners were refined inside, or None when the
+    # corners came from the full-frame edge map.
+    bbox: Optional[Tuple[int, int, int, int]] = None  # (x, y, w, h) or None
 
 
 # --------------------------------------------------------------------------- #
@@ -79,7 +81,7 @@ class DocumentProcessor:
         target_width: int = A4_WIDTH_PX,
         target_height: int = A4_HEIGHT_PX,
         min_area_ratio: float = DOC_MIN_AREA_RATIO,
-        enable_yolo: bool = ENABLE_YOLO,
+        use_roi_detector: bool = USE_ROI_DETECTOR,
         shadow_removal: bool = SHADOW_REMOVAL,
         sharpen: bool = SHARPEN,
         max_upscale_ratio: float = MAX_UPSCALE_RATIO,
@@ -91,16 +93,16 @@ class DocumentProcessor:
         self.target_width = target_width
         self.target_height = target_height
         self.min_area_ratio = min_area_ratio
-        self.enable_yolo = enable_yolo
+        self.use_roi_detector = use_roi_detector
         self.shadow_removal = shadow_removal
         self.sharpen = sharpen
         self.max_upscale_ratio = max_upscale_ratio
 
-        # Lazy imports so the camera/scanner still runs without ultralytics.
+        # Local import keeps module import-time slim.
         if detector is None:
             from detector import DocumentDetector  # noqa: WPS433 (local import)
 
-            detector = DocumentDetector(enable_yolo=self.enable_yolo)
+            detector = DocumentDetector(min_area_ratio=self.min_area_ratio)
         self.detector = detector
 
         if corner_refiner is None:
@@ -256,20 +258,18 @@ class DocumentProcessor:
         width: int,
         height: int,
     ) -> DetectionResult:
-        # Steps 7 + 8: YOLO first (if enabled), then OpenCV contour refinement.
+        # Steps 7 + 8: coarse ROI bbox first (if enabled), then corner refinement.
         bbox = None
         confidence = 0.0
-        used_yolo = False
         corners: Optional[np.ndarray] = None
 
-        if self.enable_yolo:
+        if self.use_roi_detector:
             try:
                 bbox = self.detector.detect(frame_bgr)
             except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("YOLO detection failed: %s", exc)
+                logger.warning("ROI document detection failed: %s", exc)
                 bbox = None
             if bbox is not None:
-                used_yolo = True
                 x, y, w, h = bbox
                 # Guard against out-of-bounds bbox values from the detector.
                 x = max(0, min(int(x), width))
@@ -291,7 +291,6 @@ class DocumentProcessor:
         return DetectionResult(
             corners=corners,
             confidence=float(confidence),
-            used_yolo=used_yolo,
             bbox=bbox,
         )
 
@@ -504,8 +503,6 @@ class DocumentProcessor:
                 thickness=2,
             )
         label = f"conf {detection.confidence:.2f}"
-        if detection.used_yolo:
-            label = "YOLO + " + label
         cv2.putText(
             canvas,
             label,

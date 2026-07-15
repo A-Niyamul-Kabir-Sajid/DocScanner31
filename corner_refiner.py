@@ -1,6 +1,6 @@
 """Corner refinement for document detection.
 
-Given either a region-of-interest cropped from a YOLO bbox, or a binary
+Given either a region-of-interest cropped from a detector bbox, or a binary
 edge map, returns the four ordered corners of the page (top-left, top-
 right, bottom-right, bottom-left) plus a confidence score in ``[0, 1]``.
 """

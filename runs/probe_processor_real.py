@@ -21,7 +21,7 @@ img = cv2.imread(str(src))
 H, W = img.shape[:2]
 print(f"[input] shape={img.shape}")
 
-processor = DocumentProcessor(enable_yolo=False)
+processor = DocumentProcessor(use_roi_detector=False)
 processed, detection = processor.process(img)
 print(f"[detect]  corners={'YES' if detection.corners is not None else 'NO'}")
 print(f"[detect]  confidence={detection.confidence:.3f}")

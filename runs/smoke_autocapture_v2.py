@@ -1,7 +1,7 @@
 """Verify the new 5-frame confirmation + 5 s cooldown policy.
 
 Simulates:
-  * 30 frames of a still document at realistic YOLO+approxPolyDP jitter
+  * 30 frames of a still document at realistic contour+approxPolyDP jitter
   * Auto-capture fires when stable_count reaches required_frames
   * Manual 'C' capture at frame 60 should ALSO arm the cooldown
   * A page-swap during cooldown should reset the tracker baseline so the

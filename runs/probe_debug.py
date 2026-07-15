@@ -45,7 +45,7 @@ def main() -> int:
     corners, conf = cr.from_edges(edges, w, h)
     print(f"[debug] from_edges result: corners={None if corners is None else 'found'} confidence={conf:.3f}")
 
-    # Path 2: simulate the YOLO ROI path - assume bbox covers most of the doc
+    # Path 2: simulate the ROI-detector path - assume bbox covers most of the doc
     bbox = (194, 71, 1003, 600)
     x, y, bw, bh = bbox
     roi = frame[y:y+bh, x:x+bw]

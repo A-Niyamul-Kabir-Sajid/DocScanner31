@@ -23,7 +23,7 @@ def main() -> int:
     print(f"[probe] frame shape = {w}x{h}")
 
     # Same construction as ScanSession uses.
-    proc = DocumentProcessor(enable_yolo=False)
+    proc = DocumentProcessor(use_roi_detector=False)
 
     gray = proc._to_grayscale(frame)
     blurred = proc._gaussian_blur(gray)
