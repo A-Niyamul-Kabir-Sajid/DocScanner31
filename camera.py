@@ -54,6 +54,36 @@ logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
+# Autofocus state (libcamera ``AfStateEnum``)
+# --------------------------------------------------------------------------- #
+# IMPORTANT: libcamera / picamera2 publish the autofocus state in frame
+# metadata under the key ``"AfState"``.  There is NO ``"AfStatus"`` key -- an
+# earlier version of this file polled that name, so ``meta.get(...)`` always
+# returned None, the poll loop never saw a lock, every AF pass "timed out",
+# and the lens was never pinned.  Keep ``"AfStatus"`` in the lookup order only
+# as a defensive fallback for exotic/older stacks.
+AF_STATE_KEYS = ("AfState", "AfStatus")
+AF_STATE_IDLE = 0
+AF_STATE_SCANNING = 1
+AF_STATE_FOCUSED = 2
+AF_STATE_FAILED = 3
+
+
+def _read_af_state(meta) -> Optional[int]:
+    """Return the libcamera AF state from a metadata dict, or ``None``."""
+    if not meta:
+        return None
+    for key in AF_STATE_KEYS:
+        value = meta.get(key)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # Platform detection
 # --------------------------------------------------------------------------- #
 _RPI_MODEL_PATH = "/proc/device-tree/model"
@@ -699,7 +729,7 @@ class Camera:
                     meta = req.get_metadata() or {}
                 finally:
                     req.release()
-                if meta.get("AfStatus") in (2, 3):  # Focused / Cannot focus
+                if _read_af_state(meta) in (AF_STATE_FOCUSED, AF_STATE_FAILED):
                     break
                 time.sleep(0.05)
             self._pi_cam.set_controls(
@@ -849,9 +879,9 @@ class Camera:
           callers can call it unconditionally.
         * Issues ``set_controls({"AfMode": Auto, "AfTrigger": 0})``,
           which is libcamera's "kick a one-shot AF pass" recipe.
-        * Polls the ``AfStatus`` metadata for up to ``timeout_s``
+        * Polls the ``AfState`` metadata for up to ``timeout_s``
           seconds, returning as soon as the driver reports a lock
-          (``AfStatus == 2`` -- Focused) or the timeout elapses.
+          (``AfState == 2`` -- Focused) or the timeout elapses.
         * Re-applies the AF mode the user originally asked for
           (``Continuous`` or ``Manual``) after the trigger so the LIVE
           preview returns to its baseline behaviour.
@@ -904,18 +934,18 @@ class Camera:
                 except Exception as exc:  # pragma: no cover - driver-specific
                     logger.debug("capture_metadata raised during AF: %s", exc)
                     break
-                # libcamera returns enum int values; 1=Idle, 2=Focused,
-                # 3=Scanning, 4=Failed. Anything != Focused means we
-                # keep waiting (Scanning) or give up (Failed).
-                status = meta.get("AfStatus")
-                if status == 2:
+                # libcamera AfStateEnum: 0=Idle, 1=Scanning, 2=Focused,
+                # 3=Failed -- published under the "AfState" metadata key.
+                # Anything != Focused means we keep waiting (Scanning) or
+                # give up (Failed).
+                state = _read_af_state(meta)
+                if state == AF_STATE_FOCUSED:
                     self._af_locked = True
                     break
-                if status in (1, 4):
-                    if status == 4:
-                        # Failed - no point spinning the wheel further.
-                        self._af_locked = False
-                        break
+                if state == AF_STATE_FAILED:
+                    # Failed - no point spinning the wheel further.
+                    self._af_locked = False
+                    break
                 time.sleep(0.03)
             else:
                 # Loop exhausted without a lock.
@@ -971,58 +1001,94 @@ class Camera:
         self._af_in_flight = True
         self._af_locked = None
         locked_pos = float("nan")
-        last_lens = float("nan")
         try:
+            # AF can only run in Auto mode; give libcamera a frame to apply it.
             self._pi_cam.set_controls({"AfMode": _controls.AfModeEnum.Auto})
-            try:
-                self._pi_cam.set_controls({"AfTrigger": 0})
-            except Exception:
-                pass
+            time.sleep(0.1)
 
-            deadline = time.monotonic() + max(0.1, float(timeout_s))
-            while time.monotonic() < deadline:
+            # Preferred path: picamera2's own helper.  It issues AfTrigger=Start
+            # and blocks until the cycle finishes, returning True on focus.  It
+            # gets the trigger/wait handshake right across picamera2 versions,
+            # so use it whenever it exists.
+            cycle = getattr(self._pi_cam, "autofocus_cycle", None)
+            if callable(cycle):
                 try:
-                    meta = self._pi_cam.capture_metadata() or {}
-                except Exception as exc:  # pragma: no cover - driver-specific
-                    logger.debug("capture_metadata raised during AF-lock: %s", exc)
-                    break
-                lp = meta.get("LensPosition")
-                if lp is not None:
-                    try:
-                        last_lens = float(lp)
-                    except (TypeError, ValueError):
-                        pass
-                status = meta.get("AfStatus")
-                if status == 2:            # Focused
-                    self._af_locked = True
-                    locked_pos = last_lens
-                    break
-                if status == 4:            # Failed
-                    self._af_locked = False
-                    break
-                time.sleep(0.03)
+                    self._af_locked = bool(cycle())
+                except Exception as exc:
+                    logger.debug(
+                        "autofocus_cycle() unavailable/failed (%s); "
+                        "falling back to manual AfState polling.", exc,
+                    )
+                    self._af_locked = self._poll_af_state(timeout_s, _controls)
             else:
-                self._af_locked = False
+                self._af_locked = self._poll_af_state(timeout_s, _controls)
+
+            # Whatever happened, read where the lens actually ended up.
+            locked_pos = self.get_applied_lens_position()
         except Exception as exc:  # pragma: no cover - driver-specific
             logger.warning("autofocus_and_lock failed: %s", exc)
             self._af_locked = False
         finally:
             self._af_in_flight = False
 
-        # Pin the lens.  Prefer the converged position; if AF never reported a
-        # LensPosition, fall back to the last one we saw (or the current stored
-        # value) so we at least stop continuous hunting and hold *something*.
+        # Pin the lens at the converged position.  If the driver never reported
+        # a LensPosition, keep the current stored value so we at least leave
+        # Auto mode and stop hunting.
         target = locked_pos
         if not (target == target):          # NaN check
-            target = last_lens if (last_lens == last_lens) else float(self.lens_position)
+            target = float(self.lens_position)
+            logger.warning(
+                "autofocus_and_lock: driver reported no LensPosition; "
+                "holding %.2f dpt instead.", target,
+            )
         applied = self.set_manual_focus(target)
         result = applied if (applied == applied) else target
         logger.info(
-            "autofocus_and_lock: locked=%s at %.2f dpt (driver reports %.2f)",
+            "autofocus_and_lock: focused=%s -> locked at %.2f dpt "
+            "(driver reports %.2f)",
             self._af_locked, target,
             applied if (applied == applied) else float("nan"),
         )
         return result
+
+    def _poll_af_state(self, timeout_s: float, controls) -> bool:
+        """Trigger a one-shot AF pass and poll ``AfState`` until it settles.
+
+        Fallback for picamera2 builds without ``autofocus_cycle()``.  Returns
+        ``True`` if the driver reported ``Focused`` within ``timeout_s``.
+        """
+        if self._pi_cam is None:
+            return False
+        try:
+            # AfTriggerEnum.Start kicks the one-shot pass (value 0).
+            self._pi_cam.set_controls(
+                {"AfTrigger": controls.AfTriggerEnum.Start}
+            )
+        except Exception as exc:  # pragma: no cover - driver-specific
+            logger.debug("AfTrigger Start raised (continuing): %s", exc)
+
+        deadline = time.monotonic() + max(0.1, float(timeout_s))
+        saw_scanning = False
+        while time.monotonic() < deadline:
+            try:
+                meta = self._pi_cam.capture_metadata() or {}
+            except Exception as exc:  # pragma: no cover - driver-specific
+                logger.debug("capture_metadata raised during AF poll: %s", exc)
+                return False
+            state = _read_af_state(meta)
+            if state == AF_STATE_SCANNING:
+                saw_scanning = True
+            elif state == AF_STATE_FOCUSED:
+                # Ignore a stale "Focused" from before our trigger landed:
+                # only trust it once we've observed the scan start.
+                if saw_scanning:
+                    return True
+            elif state == AF_STATE_FAILED:
+                logger.debug("AF reported Failed.")
+                return False
+            time.sleep(0.03)
+        logger.debug("AF poll timed out after %.1fs.", timeout_s)
+        return False
 
     def read(self) -> Tuple[bool, np.ndarray]:
         """Return ``(ok, frame)`` mirroring ``VideoCapture.read()``.

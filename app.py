@@ -487,7 +487,7 @@ class ScanSession:
     camera_lens_position: Optional[float] = None
     # Pi-camera-only: when True, ``capture_current_frame`` triggers a
     # single-shot autofocus on each capture (libcamera ``AfMode = Auto``,
-    # poll ``AfStatus`` until locked) so desk-distance scans come out
+    # poll ``AfState`` until locked) so desk-distance scans come out
     # sharp without running the lens motor continuously.  Off by default
     # because it adds ~1.5s of latency per shot on the IMX519 AF cycle
     # and most pages sit at the same distance -- enable with
@@ -2745,7 +2745,7 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
                    action="store_true", default=False,
                    help=("Pi-camera only.  Before each captured frame, kick a "
                          "single-shot autofocus cycle (libcamera AfMode=Auto) "
-                         "and wait up to 2s for AfStatus=Focused.  Use this "
+                         "and wait up to 2s for AfState=Focused.  Use this "
                          "when the document-to-lens distance varies between "
                          "pages; leave it off (default) for fixed-distance "
                          "desk scans where the extra latency is wasted. "
