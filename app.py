@@ -2414,12 +2414,25 @@ class ScanSession:
                        color=UI_TEXT, scale=0.55, thickness=1)
             row_y += 28
 
-            host = self.flask_server.host or self.web_host
-            port = self.flask_server.port or self.web_port
-            url = f"http://{host}:{port}/{self.last_pdf_path.name}"
-            _draw_text(canvas, f"Download link: {url}",
-                       (card_x + 24, row_y),
-                       color=UI_ACCENT, scale=0.55, thickness=1)
+            # Be defensive: with ``--no-web`` (or if the server failed to bind)
+            # ``flask_server`` may be a stub without host/port.  The PDF is on
+            # disk regardless, so never let the URL line crash the render loop.
+            try:
+                server = self.flask_server
+            except Exception:  # pragma: no cover - defensive
+                server = None
+            host = getattr(server, "host", None) or self.web_host
+            port = getattr(server, "port", None) or self.web_port
+            web_error = getattr(server, "last_error", None)
+            if web_error:
+                _draw_text(canvas, "Web UI offline - the PDF is saved on the device",
+                           (card_x + 24, row_y),
+                           color=UI_WARN, scale=0.55, thickness=1)
+            else:
+                url = f"http://{host}:{port}/{self.last_pdf_path.name}"
+                _draw_text(canvas, f"Download link: {url}",
+                           (card_x + 24, row_y),
+                           color=UI_ACCENT, scale=0.55, thickness=1)
 
         # QR on the right side of the card
         qr_size = 220
@@ -3004,8 +3017,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     if not args.web:
-        # Disable the auto-start in finish_pdf() by short-circuiting the property.
-        session._flask_server = type("_NoFlask", (), {"ensure_running": lambda self: None})()
+        # Disable the auto-start in run()/finish_pdf() by short-circuiting the
+        # property.  The stub mirrors enough of the FlaskServer surface
+        # (host/port/last_error/is_running) that the PDF_VIEW renderer and any
+        # other caller can introspect it without an AttributeError.
+        class _NoFlask:
+            host = args.host
+            port = args.port
+            last_error = "web UI disabled with --no-web"
+            is_running = False
+
+            def ensure_running(self) -> bool:
+                return False
+
+        session._flask_server = _NoFlask()
 
     try:
         session.run()

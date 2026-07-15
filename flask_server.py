@@ -15,6 +15,7 @@ Routes
 from __future__ import annotations
 
 import logging
+import socket
 import threading
 import time
 from pathlib import Path
@@ -107,6 +108,9 @@ class FlaskServer:
         self._thread: Optional[threading.Thread] = None
         self._app: Optional[Flask] = None
         self._lock = threading.Lock()
+        # Human-readable reason the web UI isn't up (``None`` when healthy).
+        # The scanner is fully usable without it, so this is informational.
+        self.last_error: Optional[str] = None
 
     # ------------------------------------------------------------------ #
     @property
@@ -114,32 +118,99 @@ class FlaskServer:
         return self._thread is not None and self._thread.is_alive()
 
     # ------------------------------------------------------------------ #
-    def ensure_running(self) -> None:
-        """Start the Flask server in a daemon thread (idempotent)."""
+    def ensure_running(self) -> bool:
+        """Start the Flask server in a daemon thread (idempotent).
+
+        **Never raises.**  The web UI is a convenience layer: a Pi in the field
+        may have no network, no DHCP lease, or the port may already be taken by
+        a previous run.  None of that should take the scanner down, so every
+        failure is logged, recorded on :attr:`last_error`, and swallowed --
+        the camera loop, capture pipeline, PDF/QR output and the desktop window
+        all keep working.  Returns ``True`` when the server is up.
+        """
         if self.is_running:
-            return
+            return True
         with self._lock:
             if self.is_running:
-                return
-            app = self.create_app()
+                return True
+
+            problem = self._preflight()
+            if problem:
+                self.last_error = problem
+                logger.warning(
+                    "Web UI unavailable: %s -- the scanner keeps running "
+                    "(desktop window + capture are unaffected).", problem,
+                )
+                return False
+
+            try:
+                app = self.create_app()
+            except Exception as exc:  # pragma: no cover - defensive
+                self.last_error = f"could not build the web app ({exc})"
+                logger.warning("Web UI unavailable: %s", self.last_error)
+                return False
+
             self._app = app
-            self._thread = threading.Thread(
-                target=app.run,
-                kwargs={
-                    "host": self.host,
-                    "port": self.port,
-                    "debug": False,
-                    "use_reloader": False,
-                    # ``threaded=True`` is REQUIRED: the live MJPEG streams hold
-                    # their connections open indefinitely, so a single-threaded
-                    # dev server would block every other request behind them.
-                    "threaded": True,
-                },
-                daemon=True,
-                name="doc-scanner-flask",
-            )
-            self._thread.start()
+            try:
+                self._thread = threading.Thread(
+                    target=self._serve,
+                    args=(app,),
+                    daemon=True,
+                    name="doc-scanner-flask",
+                )
+                self._thread.start()
+            except Exception as exc:  # pragma: no cover - defensive
+                self.last_error = f"could not start the web thread ({exc})"
+                logger.warning("Web UI unavailable: %s", self.last_error)
+                return False
+
+            self.last_error = None
             logger.info("Flask server started on http://%s:%d", self.host, self.port)
+            return True
+
+    # ------------------------------------------------------------------ #
+    def _preflight(self) -> Optional[str]:
+        """Return why we can't bind ``host:port``, or ``None`` if we can.
+
+        Catches the common field failures *before* we spawn a doomed thread:
+        the port is already held by an earlier run, or the host address isn't
+        assignable because the box has no network yet.  Note this needs no
+        *internet* -- binding works fine on a LAN-less device via loopback.
+        """
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                probe.bind((self.host, int(self.port)))
+            return None
+        except OSError as exc:
+            return f"cannot bind {self.host}:{self.port} ({exc})"
+        except Exception as exc:  # pragma: no cover - defensive
+            return f"network unavailable ({exc})"
+
+    # ------------------------------------------------------------------ #
+    def _serve(self, app: Flask) -> None:
+        """Thread body: run Flask, but never let it kill the process.
+
+        Without this guard an exception here (bind race, socket torn down when
+        Wi-Fi drops) would print a raw traceback from the thread and silently
+        leave the UI dead with no explanation.
+        """
+        try:
+            app.run(
+                host=self.host,
+                port=self.port,
+                debug=False,
+                use_reloader=False,
+                # ``threaded=True`` is REQUIRED: the live MJPEG stream holds its
+                # connection open, so a single-threaded dev server would block
+                # every other request behind it.
+                threaded=True,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            self.last_error = str(exc)
+            logger.warning(
+                "Web UI stopped: %s -- the scanner keeps running.", exc,
+            )
 
     # ------------------------------------------------------------------ #
     def create_app(self) -> Flask:
