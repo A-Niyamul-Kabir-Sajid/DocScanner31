@@ -49,7 +49,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, ClassVar, List, Optional
 
 import cv2
 import numpy as np
@@ -471,6 +471,11 @@ class ScanSession:
     the camera loop.
     """
 
+    # How many back-to-back main-loop failures we tolerate before shutting
+    # down.  One bad frame must never kill the session, but a permanently
+    # broken state shouldn't hot-spin forever either.
+    _MAX_CONSECUTIVE_TICK_ERRORS: ClassVar[int] = 30
+
     captures_dir: Path = SCANNED_DIR
     output_dir: Path = OUTPUT_DIR
     camera_source: object = 0
@@ -618,6 +623,10 @@ class ScanSession:
     # assigns it when the quad is None, so a session whose very first tick
     # already sees a document would otherwise die with an AttributeError.
     _sound_detect_start_played: bool = field(default=False, init=False)
+    # Consecutive main-loop tick failures.  Reset to 0 by any clean tick; the
+    # loop only gives up once ``_MAX_CONSECUTIVE_TICK_ERRORS`` errors happen
+    # back-to-back (see ``_survive_tick_error``).
+    _tick_errors: int = field(default=0, init=False)
 
     # Run the loop without the OpenCV desktop window (web-only).  Default off
     # since the Pi 5 deployment has a monitor attached; pass ``--headless`` for
@@ -1470,6 +1479,26 @@ class ScanSession:
         return ok, msg
 
     @_synchronized
+    def delete_page(self) -> tuple:
+        """Delete the last page + play the cues (shared by the ``X`` key + web).
+
+        Wraps :meth:`delete_last_page` with the audio/voice feedback that used
+        to live only in the ``X`` key handler -- the web endpoint called the
+        bare method, so deleting from the browser was silent.  Returns
+        ``(ok, message)``.
+        """
+        if self.delete_last_page():
+            # Soft "undo" cue so the user hears confirmation even if they're
+            # not looking at the HUD.  ``play_sound`` is MP3-first on the Pi
+            # deployment (SoundPlayer plays ``deleted.mp3`` if available,
+            # otherwise falls back to the procedural tone).
+            self.play_sound("page_deleted")
+            self.speak("page_deleted")
+            return True, self.last_message
+        self.last_message = "no pages to delete"
+        return False, self.last_message
+
+    @_synchronized
     def finish_pdf(self) -> Optional[Path]:
         """Flush ``self.pages`` into a numbered PDF and a matching QR PNG."""
         if not self.pages:
@@ -1742,16 +1771,7 @@ class ScanSession:
             self.last_message = "press D first to finish this document"
             return
         if ch == "x":
-            if self.delete_last_page():
-                # Soft "undo" cue so the user hears confirmation even if
-                # they're not looking at the HUD.  ``play_sound`` is
-                # MP3-first on the Pi deployment (SoundPlayer
-                # plays ``deleted.mp3`` if available, otherwise
-                # falls back to the procedural tone).
-                self.play_sound("page_deleted")
-                self.speak("page_deleted")
-            else:
-                self.last_message = "no pages to delete"
+            self.delete_page()
             return
         if ch == "q":
             self.show_exit_modal = True
@@ -2351,14 +2371,25 @@ class ScanSession:
     # ------------------------------------------------------------------ #
     def _render_pdf_view(self) -> np.ndarray:
         # NOTE: the camera frame is intentionally NOT drawn here - per spec.
+        #
+        # Snapshot the mutable session fields ONCE up front.  The web thread can
+        # call /new-session (-> start_new_document) at any moment, which sets
+        # ``last_pdf_path``/``last_qr_path`` to None *while this method is
+        # drawing*.  Reading ``self.last_pdf_path`` repeatedly meant a
+        # check-then-use race: the guard passed, the field went None mid-render,
+        # and the next dereference blew up with
+        # "'NoneType' object has no attribute 'name'".  Render from the locals.
+        pdf_path = self.last_pdf_path
+        qr_path = self.last_qr_path
+
         h, w = self.camera_height, self.camera_width
         canvas = np.zeros((h, w, 3), dtype=np.uint8)
         canvas[:] = UI_BG
 
         # Top status bar
         page_label = "No pages yet"
-        if self.last_pdf_path is not None:
-            n_pages = max(self.page_count_for_pdf(self.last_pdf_path), 0)
+        if pdf_path is not None:
+            n_pages = max(self.page_count_for_pdf(pdf_path), 0)
             if n_pages == 0:
                 page_label = "0 pages captured"
             elif n_pages == 1:
@@ -2403,9 +2434,9 @@ class ScanSession:
 
         # PDF name row
         row_y = card_y + 110
-        if self.last_pdf_path is not None:
-            n_pages = max(self.page_count_for_pdf(self.last_pdf_path), 0)
-            _draw_text(canvas, f"File: {self.last_pdf_path.name}",
+        if pdf_path is not None:
+            n_pages = max(self.page_count_for_pdf(pdf_path), 0)
+            _draw_text(canvas, f"File: {pdf_path.name}",
                        (card_x + 24, row_y),
                        color=UI_TEXT, scale=0.55, thickness=1)
             row_y += 28
@@ -2434,15 +2465,15 @@ class ScanSession:
                            (card_x + 24, row_y),
                            color=UI_WARN, scale=0.55, thickness=1)
             else:
-                url = f"http://{host}:{port}/{self.last_pdf_path.name}"
+                url = f"http://{host}:{port}/{pdf_path.name}"
                 _draw_text(canvas, f"Download link: {url}",
                            (card_x + 24, row_y),
                            color=UI_ACCENT, scale=0.55, thickness=1)
 
         # QR on the right side of the card
         qr_size = 220
-        if self.last_qr_path is not None and self.last_qr_path.exists():
-            qr_img = cv2.imread(str(self.last_qr_path), cv2.IMREAD_COLOR)
+        if qr_path is not None and qr_path.exists():
+            qr_img = cv2.imread(str(qr_path), cv2.IMREAD_COLOR)
             if qr_img is not None:
                 qr_img = cv2.resize(qr_img, (qr_size, qr_size),
                                     interpolation=cv2.INTER_AREA)
@@ -2592,32 +2623,68 @@ class ScanSession:
                 logger.debug("could not resize window: %s", exc)
         try:
             while not self.quit_requested:
-                # Camera heartbeat FIRST: keeps the "retry in X.Xs"
-                # countdown honest and prevents auto-capture / render
-                # from calling ``camera.read()`` before we've had a
-                # chance to recover the handle.
-                self._ensure_camera_alive()
+                try:
+                    # Camera heartbeat FIRST: keeps the "retry in X.Xs"
+                    # countdown honest and prevents auto-capture / render
+                    # from calling ``camera.read()`` before we've had a
+                    # chance to recover the handle.
+                    self._ensure_camera_alive()
 
-                # Tick the auto-capture state machine BEFORE rendering so
-                # the HUD pill shows the result of this frame's check.
-                if (
-                    self.auto_capture_enabled
-                    and self.state == ScannerState.LIVE_SCANNER_MODE
-                    and not self.show_exit_modal
-                ):
-                    self._maybe_auto_capture()
+                    # Tick the auto-capture state machine BEFORE rendering so
+                    # the HUD pill shows the result of this frame's check.
+                    if (
+                        self.auto_capture_enabled
+                        and self.state == ScannerState.LIVE_SCANNER_MODE
+                        and not self.show_exit_modal
+                    ):
+                        self._maybe_auto_capture()
 
-                canvas = self.render()
-                cv2.imshow(WINDOW_TITLE, canvas)
-                key = cv2.waitKey(30) & 0xFF
-                if key == 27:  # ESC also quits (no modal)
-                    if self.page_count() > 0 and self.last_pdf_path is None:
-                        self.finish_pdf()
-                    break
-                if key != 255:
-                    self.handle_key(key)
+                    canvas = self.render()
+                    cv2.imshow(WINDOW_TITLE, canvas)
+                    key = cv2.waitKey(30) & 0xFF
+                    if key == 27:  # ESC also quits (no modal)
+                        if self.page_count() > 0 and self.last_pdf_path is None:
+                            self.finish_pdf()
+                        break
+                    if key != 255:
+                        self.handle_key(key)
+                    self._tick_errors = 0          # tick completed cleanly
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:
+                    if not self._survive_tick_error(exc):
+                        raise
         finally:
             self.shutdown()
+
+    # ------------------------------------------------------------------ #
+    def _survive_tick_error(self, exc: Exception) -> bool:
+        """Log a main-loop exception and decide whether to keep running.
+
+        A scanner appliance should not die because one frame misbehaved -- a
+        transient driver hiccup, a page vanishing mid-render, or a race with a
+        web request should cost a frame, not the session.  We swallow the error
+        and continue, but a *persistent* fault would otherwise hot-spin forever
+        producing garbage, so we give up after
+        ``_MAX_CONSECUTIVE_TICK_ERRORS`` failures in a row.  Any successful tick
+        resets the counter.
+
+        Returns True to continue the loop, False to re-raise and exit.
+        """
+        self._tick_errors += 1
+        logger.exception(
+            "Main loop tick failed (%d/%d consecutive): %s",
+            self._tick_errors, self._MAX_CONSECUTIVE_TICK_ERRORS, exc,
+        )
+        if self._tick_errors >= self._MAX_CONSECUTIVE_TICK_ERRORS:
+            logger.error(
+                "Giving up after %d consecutive failures -- shutting down.",
+                self._tick_errors,
+            )
+            return False
+        # Brief pause so a tight failure loop can't peg the CPU.
+        time.sleep(0.1)
+        return True
 
     # ------------------------------------------------------------------ #
     def _run_headless(self) -> None:
@@ -2630,17 +2697,24 @@ class ScanSession:
         logger.info("Running headless — control the scanner from the web UI.")
         try:
             while not self.quit_requested:
-                self._ensure_camera_alive()
-                if (
-                    self.auto_capture_enabled
-                    and self.state == ScannerState.LIVE_SCANNER_MODE
-                    and not self.show_exit_modal
-                ):
-                    self._maybe_auto_capture()
-                # render() publishes to frame_bus as a side effect; we discard
-                # the canvas since there is no window to show it in.
-                self.render()
-                time.sleep(0.03)
+                try:
+                    self._ensure_camera_alive()
+                    if (
+                        self.auto_capture_enabled
+                        and self.state == ScannerState.LIVE_SCANNER_MODE
+                        and not self.show_exit_modal
+                    ):
+                        self._maybe_auto_capture()
+                    # render() publishes to frame_bus as a side effect; we
+                    # discard the canvas since there is no window to show it in.
+                    self.render()
+                    self._tick_errors = 0          # tick completed cleanly
+                    time.sleep(0.03)
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:
+                    if not self._survive_tick_error(exc):
+                        raise
         finally:
             self.shutdown()
 

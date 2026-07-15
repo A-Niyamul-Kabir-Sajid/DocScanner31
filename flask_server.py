@@ -265,6 +265,28 @@ class FlaskServer:
                 abort(404, f"document_{doc_id:03d}.pdf not found")
             return send_from_directory(pdf_dir, target.name, as_attachment=True)
 
+        @app.route("/<name>.pdf")
+        def download_pdf_by_name(name: str):
+            """Serve ``/document_001.pdf`` style URLs straight from ``output/pdf``.
+
+            This is the URL the QR code encodes (and the one the PDF_VIEW screen
+            prints), so it MUST exist -- previously only ``/pdf/<int:doc_id>``
+            was routed, and ``/download/<file>`` pointed at ``output/`` rather
+            than ``output/pdf/``, so every scanned QR landed on a 404.
+            """
+            target = pdf_dir / f"{name}.pdf"
+            # Guard against traversal (``/..%2Fetc%2Fpasswd.pdf``): the resolved
+            # path must stay inside pdf_dir.
+            try:
+                target = target.resolve()
+                if target.parent != Path(pdf_dir).resolve():
+                    abort(404)
+            except OSError:
+                abort(404)
+            if not target.exists():
+                abort(404, f"{name}.pdf not found")
+            return send_from_directory(pdf_dir, target.name, as_attachment=True)
+
         @app.route("/qr/<int:doc_id>")
         def download_qr(doc_id: int):
             target = qr_dir / f"{DOCUMENT_PREFIX}{doc_id:03d}.png"
@@ -288,7 +310,9 @@ class FlaskServer:
 
         @app.route("/delete-last-page", methods=["POST"])
         def delete_last_page():
-            removed = self.session.delete_last_page()
+            # Go through delete_page() (not the bare delete_last_page()) so the
+            # browser's X plays the same sound/voice cues as the desktop key.
+            removed, _msg = self.session.delete_page()
             return {
                 "ok": removed,
                 "session_pages": self.session.page_count(),

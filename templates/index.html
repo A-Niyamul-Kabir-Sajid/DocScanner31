@@ -246,31 +246,11 @@
             {% endif %}
         </div>
 
-        {% if pdfs %}
-            <table class="docs">
-                <thead><tr><th>#</th><th>File</th><th>QR</th><th>Links</th></tr></thead>
-                <tbody>
-                {% for num, name in pdfs %}
-                    <tr>
-                        <td><span class="pill">#{{ "%03d"|format(num) }}</span></td>
-                        <td><a href="{{ url_for('download_pdf', doc_id=num) }}">{{ name }}</a></td>
-                        <td class="qr">
-                            {% set qr_name = 'document_%03d.png'|format(num) %}
-                            {% if qr_name in qrs|map(attribute=1)|list %}
-                                <a href="{{ url_for('download_qr', doc_id=num) }}"><img src="{{ url_for('download_qr', doc_id=num) }}" alt="QR"></a>
-                            {% else %}<span class="muted">—</span>{% endif %}
-                        </td>
-                        <td>
-                            <a href="{{ url_for('download_pdf', doc_id=num) }}">PDF</a>
-                            {% if qr_name in qrs|map(attribute=1)|list %} · <a href="{{ url_for('download_qr', doc_id=num) }}">QR</a>{% endif %}
-                        </td>
-                    </tr>
-                {% endfor %}
-                </tbody>
-            </table>
-        {% else %}
+        <!-- Rebuilt client-side from /api/status so a new PDF shows up right
+             after Finish, with no page reload. -->
+        <div id="pdfsWrap">
             <div class="empty" style="margin-top:10px">No PDFs saved yet — press <kbd>D</kbd>.</div>
-        {% endif %}
+        </div>
     </details>
 </main>
 
@@ -396,7 +376,12 @@ $("#captureBtn").onclick = async () => {
 };
 $("#finishBtn").onclick = async () => {
     const b = $("#finishBtn"); busy(b, true);
-    try { const r = await postJSON("/finish"); toast("PDF saved: " + (r.pdf_name || "scan"), "ok"); }
+    try {
+        const r = await postJSON("/finish");
+        if (r.ok) toast("PDF saved: " + (r.pdf_name || "scan"), "ok");
+        else      toast(r.last_message || "Nothing to save", "err");
+        refreshStatus();          // show the new PDF in the list immediately
+    }
     catch (e) { toast("Finish failed: " + e.message, "err"); }
     finally { busy(b, false); }
 };
@@ -406,12 +391,13 @@ $("#deleteBtn").onclick = async () => {
         const r = await postJSON("/delete-last-page");
         if (r.ok) toast("Deleted — " + r.session_pages + " left", "ok");
         else      toast("No pages to delete", "err");
+        refreshStatus();
     } catch (e) { toast("Delete failed: " + e.message, "err"); }
     finally { busy(b, false); }
 };
 $("#newBtn").onclick = async () => {
     const b = $("#newBtn"); busy(b, true);
-    try { await postJSON("/new-session"); toast("New session started", "ok"); }
+    try { await postJSON("/new-session"); toast("New session started", "ok"); refreshStatus(); }
     catch (e) { toast("New session failed: " + e.message, "err"); }
     finally { busy(b, false); }
 };
@@ -461,6 +447,40 @@ function renderCaptures(names) {
         wrap.innerHTML = '<div class="empty">No pages captured yet — press <kbd>C</kbd>.</div>';
     }
 }
+let lastPdfSig = null;
+function renderPdfs(nums, qrs) {
+    const wrap = document.getElementById("pdfsWrap");
+    if (!wrap) return;
+    const sig = nums.join("|") + "#" + qrs.join("|");
+    if (sig === lastPdfSig) return;
+    lastPdfSig = sig;
+    if (!nums.length) {
+        wrap.innerHTML = '<div class="empty" style="margin-top:10px">' +
+                         'No PDFs saved yet — press <kbd>D</kbd>.</div>';
+        return;
+    }
+    const qrSet = new Set(qrs);
+    const rows = nums.map((n) => {
+        const id = String(n).padStart(3, "0");
+        const hasQr = qrSet.has(n);
+        // /pdf/<n> and /qr/<n> are the canonical routes; the QR image itself
+        // encodes the /document_NNN.pdf URL.
+        const qrCell = hasQr
+            ? `<a href="/qr/${n}"><img src="/qr/${n}" alt="QR for document_${id}"></a>`
+            : '<span class="muted">—</span>';
+        const qrLink = hasQr ? ` · <a href="/qr/${n}">QR</a>` : "";
+        return `<tr>
+            <td><span class="pill">#${id}</span></td>
+            <td><a href="/pdf/${n}">document_${id}.pdf</a></td>
+            <td class="qr">${qrCell}</td>
+            <td><a href="/pdf/${n}">PDF</a>${qrLink}</td>
+        </tr>`;
+    }).join("");
+    wrap.innerHTML =
+        '<table class="docs"><thead><tr><th>#</th><th>File</th><th>QR</th>' +
+        `<th>Links</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
 async function refreshStatus() {
     try {
         const r = await fetch("/api/status", { cache: "no-store" });
@@ -471,6 +491,7 @@ async function refreshStatus() {
         if (s.auto_capture_phase) $("#stPhase").textContent = "auto: " + s.auto_capture_phase;
         if (s.last_message) $("#stMsg").textContent = s.last_message;
         if (Array.isArray(s.captures)) renderCaptures(s.captures);
+        if (Array.isArray(s.pdfs)) renderPdfs(s.pdfs, Array.isArray(s.qrs) ? s.qrs : []);
     } catch (e) { /* retry next tick */ }
 }
 setInterval(refreshStatus, 2000);
