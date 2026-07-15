@@ -98,10 +98,19 @@ def main(argv: Optional[list] = None) -> int:  # noqa: C901
     p.add_argument("--volume", type=float, default=0.6,
                    help="Linear gain 0..1 for the short-tone player "
                         "(default: 0.6, matches the LIVE loop).")
+    p.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
+        help="Logging verbosity for the sound / mp3_player modules. "
+             "Use DEBUG on the Pi to see exactly why _alsa_available() "
+             "is returning False (e.g. 'alsa backend skipped: ffmpeg not "
+             "on PATH').",
+    )
     args = p.parse_args(argv)
 
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s | %(message)s",
     )
 
@@ -158,8 +167,8 @@ def main(argv: Optional[list] = None) -> int:  # noqa: C901
                 size = f"<missing: {exc!r}>"
             print(f"    - {name}: {path} ({size} bytes)")
     _check(
-        player._backend_name in ("winsound", "cli"),
-        f"backend is one of winsound|cli (got {player._backend_name!r})",
+        player._backend_name in ("winsound", "cli", "alsa"),
+        f"backend is one of winsound|cli|alsa (got {player._backend_name!r})",
     )
     _check(player.enabled is True, "SoundPlayer is enabled")
     _check(
@@ -307,7 +316,8 @@ def main(argv: Optional[list] = None) -> int:  # noqa: C901
         "        no-op on Windows -- use the short WAV tones on the\n"
         "        dev box.\n"
         "    [5] Set logging to DEBUG to see exactly which event\n"
-        "        fired and which one was dropped:\n"
+        "        fired and which one was dropped (and, on Linux, why\n"
+        "        _alsa_available() may have skipped the Pi I2S backend):\n"
         "          python -m runs.manual_audio_check --log-level DEBUG"
     )
 
