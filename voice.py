@@ -93,6 +93,9 @@ _PHRASE_TEMPLATES: Dict[str, str] = {
     "capture_auto":     "Page added automatically",
     "capture_rejected": "Capture rejected, {reason}",
 
+    # Focus
+    "focus_locked":     "Focus locked",
+
     # Page change detector
     "page_change":      "Page {n}",
 

@@ -443,7 +443,24 @@ window.addEventListener("keydown", (ev) => {
     else if (k === "q") $("#quitBtn").click();
 });
 
-/* ---------- status strip ---------- */
+/* ---------- status strip + captured-pages gallery ---------- */
+let lastCapSig = null;
+function renderCaptures(names) {
+    const wrap = document.getElementById("capturesWrap");
+    if (!wrap) return;
+    const sig = names.join("|");
+    if (sig === lastCapSig) return;      // only rebuild when the set changes
+    lastCapSig = sig;
+    const bust = Date.now();             // fresh param so renumbered files update
+    if (names.length) {
+        wrap.innerHTML = '<div class="gallery">' + names.map((name, i) =>
+            `<figure><img src="/captures/${encodeURIComponent(name)}?t=${bust}" ` +
+            `loading="lazy" alt="${name}"><figcaption>#${i + 1} · ${name}</figcaption></figure>`
+        ).join("") + '</div>';
+    } else {
+        wrap.innerHTML = '<div class="empty">No pages captured yet — press <kbd>C</kbd>.</div>';
+    }
+}
 async function refreshStatus() {
     try {
         const r = await fetch("/api/status", { cache: "no-store" });
@@ -453,6 +470,7 @@ async function refreshStatus() {
         if (s.scan_mode) $("#stMode").textContent = "mode: " + s.scan_mode;
         if (s.auto_capture_phase) $("#stPhase").textContent = "auto: " + s.auto_capture_phase;
         if (s.last_message) $("#stMsg").textContent = s.last_message;
+        if (Array.isArray(s.captures)) renderCaptures(s.captures);
     } catch (e) { /* retry next tick */ }
 }
 setInterval(refreshStatus, 2000);

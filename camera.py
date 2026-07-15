@@ -942,6 +942,88 @@ class Camera:
         )
         return bool(self._af_locked)
 
+    def autofocus_and_lock(self, timeout_s: float = 3.0) -> float:
+        """Run one-shot AF, then **lock** the lens where AF converged.
+
+        Unlike :meth:`trigger_autofocus` (which restores the previous AF mode
+        afterwards), this reads the ``LensPosition`` the autofocus pass settled
+        on and pins the lens there in ``AfMode=Manual`` so it stays put — ideal
+        for a document scanner where the page sits at a fixed distance and
+        continuous-AF hunting would only introduce blur.
+
+        Side effects: updates ``self.lens_position`` to the locked value and
+        sets ``self.autofocus = False`` (via :meth:`set_manual_focus`).
+
+        Returns the locked ``LensPosition`` in dioptres, or ``float('nan')`` on
+        the OpenCV backend / a closed camera / when libcamera is unavailable.
+        """
+        if self.backend != "picamera2" or self._pi_cam is None or not self.is_open:
+            return float("nan")
+        if self._af_in_flight:
+            # Another AF pass is already running; don't stack a second.
+            return float(self.lens_position)
+        try:
+            from libcamera import controls as _controls  # type: ignore
+        except Exception:
+            logger.debug("libcamera not importable; skipping autofocus_and_lock.")
+            return float("nan")
+
+        self._af_in_flight = True
+        self._af_locked = None
+        locked_pos = float("nan")
+        last_lens = float("nan")
+        try:
+            self._pi_cam.set_controls({"AfMode": _controls.AfModeEnum.Auto})
+            try:
+                self._pi_cam.set_controls({"AfTrigger": 0})
+            except Exception:
+                pass
+
+            deadline = time.monotonic() + max(0.1, float(timeout_s))
+            while time.monotonic() < deadline:
+                try:
+                    meta = self._pi_cam.capture_metadata() or {}
+                except Exception as exc:  # pragma: no cover - driver-specific
+                    logger.debug("capture_metadata raised during AF-lock: %s", exc)
+                    break
+                lp = meta.get("LensPosition")
+                if lp is not None:
+                    try:
+                        last_lens = float(lp)
+                    except (TypeError, ValueError):
+                        pass
+                status = meta.get("AfStatus")
+                if status == 2:            # Focused
+                    self._af_locked = True
+                    locked_pos = last_lens
+                    break
+                if status == 4:            # Failed
+                    self._af_locked = False
+                    break
+                time.sleep(0.03)
+            else:
+                self._af_locked = False
+        except Exception as exc:  # pragma: no cover - driver-specific
+            logger.warning("autofocus_and_lock failed: %s", exc)
+            self._af_locked = False
+        finally:
+            self._af_in_flight = False
+
+        # Pin the lens.  Prefer the converged position; if AF never reported a
+        # LensPosition, fall back to the last one we saw (or the current stored
+        # value) so we at least stop continuous hunting and hold *something*.
+        target = locked_pos
+        if not (target == target):          # NaN check
+            target = last_lens if (last_lens == last_lens) else float(self.lens_position)
+        applied = self.set_manual_focus(target)
+        result = applied if (applied == applied) else target
+        logger.info(
+            "autofocus_and_lock: locked=%s at %.2f dpt (driver reports %.2f)",
+            self._af_locked, target,
+            applied if (applied == applied) else float("nan"),
+        )
+        return result
+
     def read(self) -> Tuple[bool, np.ndarray]:
         """Return ``(ok, frame)`` mirroring ``VideoCapture.read()``.
 

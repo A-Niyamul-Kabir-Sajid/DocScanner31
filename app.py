@@ -493,6 +493,12 @@ class ScanSession:
     # and most pages sit at the same distance -- enable with
     # ``--autofocus-on-capture`` when the doc-to-lens distance varies.
     autofocus_on_capture: bool = False
+    # Run a one-shot autofocus at startup and then LOCK the lens at the
+    # position it converged on (picamera2 only).  A document scanner wants a
+    # fixed focus, so this gives a sharp, stable image without continuous-AF
+    # hunting.  Skipped automatically when the user pins ``--lens-position``
+    # (an explicit manual focus wins); disable with ``--no-startup-autofocus``.
+    startup_autofocus_lock: bool = True
     # Rotate captured frames before they leave ``Camera.read()``.  Use this
     # when the camera module is physically mounted in portrait but the
     # sensor still delivers landscape frames, or when you simply want the
@@ -1852,12 +1858,45 @@ class ScanSession:
                 f"step {delta_dpt:+.2f}"
             )
 
-    def trigger_focus_lock(self) -> None:
-        """Kick a one-shot AF cycle (``AfMode=Auto``) on the picamera2
-        backend, then re-apply the user's preferred mode.
+    def _startup_focus_lock(self) -> None:
+        """One-shot autofocus-and-lock at boot (picamera2 only).
 
-        This is the [F] hotkey -- gives you a single auto-focus pass for
-        the current scene without leaving continuous-AF on permanently.
+        Called once from the main loop before the first frame is rendered.
+        Ensures the camera handle exists, waits briefly for the first frames so
+        libcamera has something to focus on, then locks the lens where AF
+        converges.  Best-effort: any failure is logged and the app carries on.
+        """
+        if not self.startup_autofocus_lock:
+            return
+        # Materialise / reopen the camera if needed.
+        self._ensure_camera_alive()
+        cam = getattr(self, "_camera", None)
+        if cam is None or not cam.is_open or cam.backend != "picamera2":
+            return
+        # Give the sensor a moment to deliver a few frames before AF runs,
+        # otherwise the first AF pass has nothing exposed to converge on.
+        time.sleep(0.4)
+        logger.info("Startup autofocus: focusing and locking the lens…")
+        self.last_message = "focusing at startup…"
+        try:
+            locked_at = cam.autofocus_and_lock(timeout_s=FOCUS_LOCK_TIMEOUT_S)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("startup autofocus failed: %s", exc)
+            return
+        if locked_at == locked_at:  # not NaN
+            cm = 100.0 / max(0.1, locked_at)
+            self.last_message = f"focus locked at {locked_at:.2f} dpt (≈{cm:0.0f} cm)"
+            logger.info(self.last_message)
+            self.speak("focus_locked")
+
+    def trigger_focus_lock(self) -> None:
+        """Kick a one-shot AF cycle on picamera2 and **lock** the lens there.
+
+        This is the [F] hotkey (and the ``/focus`` web endpoint): it runs a
+        single autofocus pass, then pins ``LensPosition`` at whatever the AF
+        converged on (``AfMode=Manual``) so the focus stays fixed for the rest
+        of the session instead of drifting back to continuous hunting or the
+        old manual position.  Press F again to re-focus and re-lock.
         """
         cam = getattr(self, "_camera", None)
         if cam is None or not cam.is_open:
@@ -1866,20 +1905,16 @@ class ScanSession:
         if cam.backend != "picamera2":
             self.last_message = "autofocus only on --backend picamera2"
             return
-        # ``Camera.trigger_autofocus`` polls AfStatus for up to
-        # FOCUS_LOCK_TIMEOUT_S and then restores the user's AF mode.
-        self.last_message = "focusing... (one-shot AF)"
-        locked = bool(cam.trigger_autofocus(timeout_s=FOCUS_LOCK_TIMEOUT_S))
-        # Update the last_message AFTER the call so the user sees a result.
-        # We can't read AfStatus from the post-call AfMode, but the
-        # trigger_autofocus() logger shows it; the user can press F again
-        # if it didn't lock.
-        if locked:
-            self.last_message = "focus locked (one-shot AF complete)"
-        else:
+        self.last_message = "focusing... (one-shot AF, then lock)"
+        locked_at = cam.autofocus_and_lock(timeout_s=FOCUS_LOCK_TIMEOUT_S)
+        if locked_at == locked_at:  # not NaN
+            cm = 100.0 / max(0.1, locked_at)
             self.last_message = (
-                "focus didn't lock in time -- nudged default; try F again"
+                f"focus locked at {locked_at:.2f} dpt (≈{cm:0.0f} cm)"
             )
+            self.speak("focus_locked")
+        else:
+            self.last_message = "focus lock failed -- try F again"
 
     def _focus_status_label(self) -> str:
         """Human-readable focus mode + lens position for the HUD pill.
@@ -2495,6 +2530,10 @@ class ScanSession:
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("web UI failed to start: %s", exc)
 
+        # One-shot autofocus + lock at boot so the scan starts sharp and stays
+        # fixed (picamera2 only; no-op otherwise).
+        self._startup_focus_lock()
+
         # Headless (``--headless``): no OpenCV window.  The loop still reads the
         # camera, ticks the FSM, and publishes frames to the bus so the web UI
         # is the whole interface.  There is no keyboard in this mode.
@@ -2698,6 +2737,16 @@ def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
                          "pages; leave it off (default) for fixed-distance "
                          "desk scans where the extra latency is wasted. "
                          "Honoured only when --backend picamera2 is active."))
+    p.add_argument("--startup-autofocus", dest="startup_autofocus",
+                   action="store_true", default=None,
+                   help=("Pi-camera only.  At boot, run one autofocus pass and "
+                         "LOCK the lens where it converges, then hold that focus "
+                         "for the session (a scanner wants fixed focus).  This is "
+                         "the default unless --lens-position pins a manual focus. "
+                         "Press F any time to re-focus and re-lock."))
+    p.add_argument("--no-startup-autofocus", dest="startup_autofocus",
+                   action="store_false",
+                   help="Skip the boot-time autofocus-and-lock.")
     p.add_argument("--fullscreen", dest="fullscreen", action="store_true",
                    default=False,
                    help=("Open the OpenCV window in fullscreen mode (default: "
@@ -2820,6 +2869,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     args = _parse_args(argv)
+
+    # Startup autofocus-and-lock policy: default ON, but an explicit
+    # --lens-position (a pinned manual focus) turns it off unless the user
+    # also passed --startup-autofocus.  --no-startup-autofocus always wins.
+    _lens_given = getattr(args, "lens_position", None) is not None
+    _startup_flag = getattr(args, "startup_autofocus", None)
+    if _startup_flag is None:
+        _startup_lock = not _lens_given
+    else:
+        _startup_lock = bool(_startup_flag)
+
     session = ScanSession(
         camera_source=_coerce_source(args.source),
         camera_backend=args.backend,
@@ -2835,6 +2895,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         scan_mode=args.scan_mode,
         window_fullscreen=bool(args.fullscreen),
         headless=bool(getattr(args, "headless", False)),
+        startup_autofocus_lock=_startup_lock,
     )
 
     if args.no_quality_gate:
