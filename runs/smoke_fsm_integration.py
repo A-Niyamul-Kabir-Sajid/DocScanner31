@@ -110,7 +110,7 @@ def main() -> int:
     # Force controller config to user's spec.
     sess.auto_capture_enabled = True
     sess.auto_capture_stable_frames = 5  # keep the test fast; prod default is 60 (~2 s)
-    sess.auto_capture.s2_no_match_timeout_s = 3.0
+    sess.auto_capture.s2_no_match_timeout_s = 1.5
     sess.auto_capture.tolerance = 18.0
 
     print("=== T1: 12 LIVE ticks on a still document ===")
