@@ -65,7 +65,7 @@ class AutoCaptureController:
     # means the user is still showing the same page.
     tolerance: float = 18.0
     # Continuous seconds of "no match" required to flip State 2 -> 1.
-    s2_no_match_timeout_s: float = 2.0
+    s2_no_match_timeout_s: float = 1.5
     motion_trigger_px: float = 25.0
     tracker: StabilityTracker = field(default_factory=StabilityTracker)
 
