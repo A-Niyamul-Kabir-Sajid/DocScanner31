@@ -140,7 +140,7 @@ DEFAULT_SOUND_ALSA_CHUNK_BYTES: int = 4096
 # tick (~33 fps) ``required_frames`` is roughly the wait time in seconds
 # times 33, so the default 60 is ~1.8 s on the LIVE loop.  Bump this for a
 # longer "hold still" window, drop it for snappier auto-capture.
-DEFAULT_STABLE_FRAMES: int = 10  # ~1.8 s at the 30 ms LIVE tick
+DEFAULT_STABLE_FRAMES: int = 5  # ~1.8 s at the 30 ms LIVE tick
 # Maximum corner drift (pixels) tolerated between consecutive frames.
 # The contour + approxPolyDP pass routinely jitters 8-15 px even when the document
 # is held still, so a tight 6 px threshold never lets the streak build.
