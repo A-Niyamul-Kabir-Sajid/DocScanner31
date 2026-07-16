@@ -15,10 +15,17 @@ to tweak — here is exactly what each one does and where to change it.
 > wall-clock timer. When the timer reaches the threshold, the FSM flips
 > back to `S1_SEEKING_STABLE` so the next page can auto-capture.
 
-**Knob:** `AutoCaptureController.s2_no_match_timeout_s`
-**File:** `auto_capture_controller.py`, **line 68**
+**Knob (runtime):** `ScanSession.auto_capture_cooldown_s`
+**Backed by:** `DEFAULT_AUTO_CAPTURE_COOLDOWN`
+**File:** `config.py`, **line 121**
 **Current value:** `1.5` seconds
 **Type:** float (wall-clock seconds, NOT frames)
+
+> ⚠️ The dataclass field `AutoCaptureController.s2_no_match_timeout_s`
+> (auto_capture_controller.py:71) is the *fallback default*. At runtime
+> the LIVE pipeline passes `auto_capture_cooldown_s` straight in
+> (see `app.py:827`), so this `config.py` value is the one that
+> actually controls the LIVE app.
 
 ```python
 @dataclass
@@ -147,7 +154,8 @@ to `3.0` – `4.0`.
 
 | Knob | File:line | Effect | Default |
 |---|---|---|---|
-| `s2_no_match_timeout_s` | `auto_capture_controller.py:68` | Wall-clock seconds before S2 → S1 | `1.5 s` |
+| `s2_no_match_timeout_s` | `auto_capture_controller.py:71` | Wall-clock seconds before S2 → S1 (dataclass fallback) | `0.5 s` |
+| `DEFAULT_AUTO_CAPTURE_COOLDOWN` | `config.py:121` | Wall-clock seconds before S2 → S1 (LIVE default, used at `app.py:827`) | `1.5 s` |
 | `DEFAULT_STABLE_FRAMES` | `config.py:143` | Frames of stillness before S1 fires | `60` (~1.8 s) |
 | `DEFAULT_STABILITY_TOLERANCE` | `config.py:149` | Max pixel drift counted as "still" | `18.0 px` |
 | `jitter_band` | `stability_tracker.py:21` | Multiple of tolerance still treated as noise | `2.5` |
@@ -161,14 +169,14 @@ to `3.0` – `4.0`.
 **Snappy scanner** (fire fast, accept some risk of blur):
 ```python
 DEFAULT_STABLE_FRAMES = 33          # ~1.0 s
-s2_no_match_timeout_s = 1.0
+DEFAULT_AUTO_CAPTURE_COOLDOWN = 1.0
 DEFAULT_STABILITY_TOLERANCE = 12.0
 ```
 
 **Conservative scanner** (no spurious captures, no wobbly hands):
 ```python
 DEFAULT_STABLE_FRAMES = 99          # ~3.0 s
-s2_no_match_timeout_s = 3.0
+DEFAULT_AUTO_CAPTURE_COOLDOWN = 3.0
 DEFAULT_STABILITY_TOLERANCE = 25.0
 jitter_band = 3.5
 ```
@@ -176,7 +184,7 @@ jitter_band = 3.5
 **Current balance** (project default):
 ```python
 DEFAULT_STABLE_FRAMES = 60          # ~1.8 s
-s2_no_match_timeout_s = 1.5
+DEFAULT_AUTO_CAPTURE_COOLDOWN = 1.5
 DEFAULT_STABILITY_TOLERANCE = 18.0
 jitter_band = 2.5
 ```

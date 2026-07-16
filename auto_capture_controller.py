@@ -67,8 +67,8 @@ class AutoCaptureController:
     # Continuous seconds of "no match" required to flip State 2 -> 1.
     # The State 2 timer measures how long the live quad has been *not similar*
     # to ``last_captured_quad``; when it reaches this value the FSM returns
-    # to State 1 so the next auto-capture can fire.  Currently 1.0 s.
-    s2_no_match_timeout_s: float = 1.0
+    # to State 1 so the next auto-capture can fire.  Currently 0.5 s.
+    s2_no_match_timeout_s: float = 0.5
     motion_trigger_px: float = 25.0
     tracker: StabilityTracker = field(default_factory=StabilityTracker)
 

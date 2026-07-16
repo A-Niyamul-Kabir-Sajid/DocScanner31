@@ -116,9 +116,9 @@ CORNER_CONFIDENCE_MIN: float = 0.30
 # consecutive frames (~2 s at the default 30 ms LIVE tick, i.e. 60 frames).
 # After each capture the FSM parks in State 2 and only flips back to
 # State 1 after ``DEFAULT_AUTO_CAPTURE_COOLDOWN`` seconds of continuous
-# no-match, giving the user time to swap pages.
+# no-match, giving the user time to swap pages.  Currently 1.5 s.
 DEFAULT_AUTO_CAPTURE_ENABLED: bool = True
-DEFAULT_AUTO_CAPTURE_COOLDOWN: float = 3.0  # 3 s no-match window in State 2 before flipping back to State 1
+DEFAULT_AUTO_CAPTURE_COOLDOWN: float = 1.5  # 1.5 s no-match window in State 2 before flipping back to State 1
 
 # --------------------------------------------------------------------------- #
 # Audio cues - short WAV beeps for "doc detected / stable / captured".
